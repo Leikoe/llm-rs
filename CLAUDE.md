@@ -11,23 +11,23 @@ High-performance LLM inference engine in Rust targeting Apple Metal (primary) an
 - If you need a comment to explain what the code does, the code is too clever.
 
 ## Current Scope (v0.1)
-- **Models:** LLaMA family (LLaMA 3.2, Mistral) -- dense only
+- **Models:** LLaMA family (LLaMA 3.x, Mistral) -- dense only
 - **Weights:** GGUF format, direct file read
-- **Quantizations:** BF16 (primary unquantized), FP16, Q4_0, Q8_0
-- **Backend:** CPU with Accelerate BLAS (Metal backend in Phase 2)
+- **Quantizations:** BF16, FP16, F32, Q4_0, Q8_0, Q4_K, Q6_K
+- **Backend:** Metal (primary, ~50 tok/s 1B, ~9 tok/s 8B), CPU fallback
 - **CLI:** Interactive chat + single-shot completion
-- **Tokenizer:** BPE from GGUF metadata, GPT-2 byte-level encoding (no external crate)
+- **Tokenizer:** BPE from GGUF metadata, GPT-2 byte-level encoding with special token support (no external crate)
 
 ## Architecture
 - `src/gguf/` -- GGUF parser, direct file read into owned buffer
 - `src/tokenizer/` -- BPE tokenizer (GPT-2 byte-level for LLaMA 3, sentencepiece for LLaMA 2)
 - `src/tensor/` -- DType enum, TensorView (borrows from GgufFile buffer)
-- `src/backend/` -- Backend trait (~12 ops), CPU impl, Metal impl (WIP)
+- `src/backend/` -- Backend trait (~12 ops), CPU impl, Metal impl
 - `src/model/` -- ModelConfig, LLaMA forward pass with GQA
 - `src/kv_cache/` -- Per-layer KV cache, flat [max_seq_len, kv_dim] buffers
 - `src/sampler/` -- Temperature, top-k, top-p, custom xorshift64 PRNG
 - `src/cli/` -- Clap-based CLI: `complete` and `chat` subcommands
-- `shaders/` -- Metal compute shaders (Phase 2)
+- `shaders/` -- Metal compute shaders (ops.metal: embed, matvec, SIMD matvec, rms_norm, rope, softmax, silu, elementwise, GQA attention)
 - `build.rs` -- Metal shader compilation (.metal -> .air -> .metallib via xcrun)
 
 ## Key Design Decisions
@@ -107,36 +107,39 @@ Accelerate BLAS for FP32 matmul, NEON SIMD for quantized dot products. BF16/FP16
 ```bash
 cargo build --release
 ./target/release/llm-rs -m models/Llama-3.2-1B-Instruct-BF16.gguf complete -p "Hello" -n 30 --temperature 0
-./target/release/llm-rs -m models/Llama-3.2-1B-Instruct-BF16.gguf chat
+./target/release/llm-rs -m models/Llama-3.1-8B-Instruct-Q4_K_M.gguf chat
 ```
 
 ## Implementation Phases
 
 ### Phase 1: Foundation (done)
-- GGUF parser with mmap, metadata, tensor views
-- BPE tokenizer from GGUF metadata (GPT-2 byte-level encoding)
+- GGUF parser, metadata, tensor views
+- BPE tokenizer from GGUF metadata (GPT-2 byte-level encoding, special token support)
 - DType enum, TensorView with GGML dimension convention
-- CPU backend with naive loops (Accelerate/NEON optimization pending)
+- CPU backend with naive loops
 - LLaMA forward pass with GQA, pre-allocated activation buffers
 - CLI with `complete` and `chat` subcommands, sampler
 - Validated on LLaMA 3.2 1B Instruct BF16 (~0.7 tok/s CPU)
 
-### Phase 2: Metal (next)
-- MetalBackend init: device, queue, shader compilation, pipeline cache
-- Metal shaders: quantized_matmul, bf16_matmul, rmsnorm, rope, softmax, silu, elementwise, embedding
-- Wire Backend trait to shader dispatch
-- Move attention computation to GPU
-- Validate output matches CPU backend token-for-token
+### Phase 2: Metal (done)
+- MetalBackend: device, queue, runtime shader compilation, pipeline cache
+- SIMD matvec kernels (32-lane cooperative dot products via simd_sum)
+- GPU GQA attention kernel (eliminates per-layer GPU round-trips)
+- Lazy command buffer batching (single MTLCommandBuffer per forward pass)
+- Q4_K and Q6_K quantization support (CPU + Metal)
+- Prefill optimization (skip output projection for non-final tokens)
+- Chat template with special token encoding for LLaMA 3
+- 1B BF16: ~50 tok/s, 8B Q4_K_M: ~9 tok/s on M1 Pro
 
-### Phase 3: Polish
+### Phase 3: Polish (next)
 - Error handling (replace panics with `Result`)
 - Performance profiling with Instruments
-- Shader optimization (tiled GEMM, simdgroup reductions)
-- Chat template handling
+- Batched prefill (GEMM instead of sequential matvec)
+- CPU backend optimization (Accelerate BLAS, NEON SIMD)
 
 ## Verification
 1. **GGUF parser:** tensor count/shapes/metadata match llama.cpp output
 2. **Tokenizer:** encode/decode round-trip matches llama.cpp
 3. **CPU forward pass:** greedy output matches llama.cpp for same model + prompt
-4. **Metal forward pass:** output matches CPU backend token-for-token
-5. **End-to-end:** coherent chat with 1B+ model, reasonable tok/s
+4. **Metal forward pass:** output matches CPU backend token-for-token ✓ (verified 1B BF16)
+5. **End-to-end:** coherent chat with 8B Q4_K_M model at ~9 tok/s ✓

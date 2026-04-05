@@ -56,7 +56,7 @@ fn run_completion(
     // Then forward the last token to get the first set of logits.
     let start = Instant::now();
     for (i, &token) in tokens.iter().enumerate().take(tokens.len().saturating_sub(1)) {
-        model.forward(backend, token, i);
+        model.forward_kv_only(backend, token, i);
     }
     let last_prompt_pos = tokens.len() - 1;
     let mut logits = model.forward(backend, tokens[last_prompt_pos], last_prompt_pos);
@@ -77,7 +77,7 @@ fn run_completion(
     loop {
         let next_token = sampler.sample(&mut logits);
 
-        if next_token == tokenizer.eos_id || generated >= max_tokens {
+        if next_token == tokenizer.eos_id || tokenizer.eot_id == Some(next_token) || generated >= max_tokens {
             break;
         }
 
@@ -112,7 +112,7 @@ fn run_chat(
     let mut pos = 0;
 
     // BOS token
-    model.forward(backend, tokenizer.bos_id, pos);
+    model.forward_kv_only(backend, tokenizer.bos_id, pos);
     pos += 1;
 
     // System prompt
@@ -122,7 +122,7 @@ fn run_chat(
         );
         let sys_tokens = tokenizer.encode(&sys_text);
         for &token in &sys_tokens {
-            model.forward(backend, token, pos);
+            model.forward_kv_only(backend, token, pos);
             pos += 1;
         }
     }
@@ -150,7 +150,7 @@ fn run_chat(
 
         // Prefill user message (all but last token)
         for &token in user_tokens.iter().take(user_tokens.len().saturating_sub(1)) {
-            model.forward(backend, token, pos);
+            model.forward_kv_only(backend, token, pos);
             pos += 1;
         }
 
@@ -162,7 +162,7 @@ fn run_chat(
         loop {
             let next_token = sampler.sample(&mut logits);
 
-            if next_token == tokenizer.eos_id {
+            if next_token == tokenizer.eos_id || tokenizer.eot_id == Some(next_token) {
                 break;
             }
 

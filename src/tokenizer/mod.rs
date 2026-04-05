@@ -23,6 +23,7 @@ pub struct Tokenizer {
     merges: HashMap<(Vec<u8>, Vec<u8>), u32>,
     pub bos_id: u32,
     pub eos_id: u32,
+    pub eot_id: Option<u32>,
     /// Whether this tokenizer uses GPT-2 byte-level encoding (LLaMA 3)
     /// vs sentencepiece (LLaMA 2).
     is_byte_level: bool,
@@ -73,6 +74,11 @@ impl Tokenizer {
             .and_then(|v| v.as_u32())
             .unwrap_or(2);
 
+        let eot_id = metadata
+            .get("tokenizer.ggml.eot_token_id")
+            .and_then(|v| v.as_u32())
+            .or_else(|| token_to_id.get("<|eot_id|>".as_bytes()).copied());
+
         // Detect GPT-2 byte-level tokenizer: check if vocab contains Ġ (U+0120)
         // which is the GPT-2 encoding of space (0x20).
         let tokenizer_model = metadata
@@ -87,16 +93,46 @@ impl Tokenizer {
             merges,
             bos_id,
             eos_id,
+            eot_id,
             is_byte_level,
         }
     }
 
     /// Encode text to token IDs using BPE.
+    /// Recognizes special tokens like `<|...|>` and maps them directly to their IDs.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
             return vec![];
         }
-        bpe::bpe_encode(text, &self.token_to_id, &self.merges, self.is_byte_level)
+        let mut tokens = Vec::new();
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            // Look for special token pattern <|...|>
+            if let Some(start) = remaining.find("<|") {
+                // Encode the text before the special token
+                if start > 0 {
+                    tokens.extend(bpe::bpe_encode(&remaining[..start], &self.token_to_id, &self.merges, self.is_byte_level));
+                }
+                if let Some(end) = remaining[start..].find("|>") {
+                    let special = &remaining[start..start + end + 2];
+                    if let Some(&id) = self.token_to_id.get(special.as_bytes()) {
+                        tokens.push(id);
+                    } else {
+                        // Not a known special token, encode as regular text
+                        tokens.extend(bpe::bpe_encode(special, &self.token_to_id, &self.merges, self.is_byte_level));
+                    }
+                    remaining = &remaining[start + end + 2..];
+                } else {
+                    // No closing |>, encode rest as text
+                    tokens.extend(bpe::bpe_encode(remaining, &self.token_to_id, &self.merges, self.is_byte_level));
+                    break;
+                }
+            } else {
+                tokens.extend(bpe::bpe_encode(remaining, &self.token_to_id, &self.merges, self.is_byte_level));
+                break;
+            }
+        }
+        tokens
     }
 
     /// Decode token IDs back to a string.

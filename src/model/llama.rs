@@ -114,7 +114,9 @@ impl LlamaModel {
         }
     }
 
-    pub fn forward(&mut self, backend: &dyn Backend, token: u32, pos: usize) -> Vec<f32> {
+    /// Run one token through all transformer layers, populating the KV cache.
+    /// Does NOT compute logits — use this for prefill tokens where logits aren't needed.
+    pub fn forward_kv_only(&mut self, backend: &dyn Backend, token: u32, pos: usize) {
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
 
@@ -153,7 +155,11 @@ impl LlamaModel {
 
             backend.add(&mut self.act.x, &self.act.x2, &self.act.ffn_out);
         }
+    }
 
+    /// Run one token through the full model and return logits.
+    pub fn forward(&mut self, backend: &dyn Backend, token: u32, pos: usize) -> Vec<f32> {
+        self.forward_kv_only(backend, token, pos);
         backend.rms_norm(&mut self.act.x_norm, &self.act.x, &self.weights.output_norm, self.config.norm_eps);
         backend.matvec_mul(&mut self.act.logits, &self.weights.output_weight, &self.act.x_norm);
         backend.read_to_vec_f32(&self.act.logits)
