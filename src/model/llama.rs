@@ -1,4 +1,3 @@
-use crate::backend::cpu::write_f32_to_buffer;
 use crate::backend::{Backend, DeviceBuffer};
 use crate::gguf::GgufFile;
 use crate::kv_cache::KVCache;
@@ -118,8 +117,6 @@ impl LlamaModel {
     pub fn forward(&mut self, backend: &dyn Backend, token: u32, pos: usize) -> Vec<f32> {
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
-        let kv_dim = self.config.n_kv_heads * head_dim;
-        let heads_per_kv = n_heads / self.config.n_kv_heads;
 
         backend.embed(&mut self.act.x, &self.weights.token_embedding, token);
 
@@ -135,13 +132,13 @@ impl LlamaModel {
 
             self.kv_cache.store(backend, layer_idx, pos, &self.act.k, &self.act.v);
 
-            let attn_result = compute_attention(
-                backend, &self.act.q,
+            backend.gqa_attention(
+                &mut self.act.attn_out,
+                &self.act.q,
                 &self.kv_cache.k_cache[layer_idx],
                 &self.kv_cache.v_cache[layer_idx],
-                pos, n_heads, head_dim, kv_dim, heads_per_kv,
+                pos, n_heads, self.config.n_kv_heads, head_dim,
             );
-            write_f32_to_buffer(&mut self.act.attn_out, &attn_result);
 
             backend.matvec_mul(&mut self.act.wo_out, &layer.wo, &self.act.attn_out);
             backend.add(&mut self.act.x2, &self.act.x, &self.act.wo_out);
@@ -161,60 +158,4 @@ impl LlamaModel {
         backend.matvec_mul(&mut self.act.logits, &self.weights.output_weight, &self.act.x_norm);
         backend.read_to_vec_f32(&self.act.logits)
     }
-}
-
-fn compute_attention(
-    backend: &dyn Backend,
-    q_buf: &DeviceBuffer,
-    k_cache_buf: &DeviceBuffer,
-    v_cache_buf: &DeviceBuffer,
-    pos: usize,
-    n_heads: usize,
-    head_dim: usize,
-    kv_dim: usize,
-    heads_per_kv: usize,
-) -> Vec<f32> {
-    let q_data = backend.read_to_vec_f32(q_buf);
-    let k_cache = backend.read_to_vec_f32(k_cache_buf);
-    let v_cache = backend.read_to_vec_f32(v_cache_buf);
-
-    let dim = n_heads * head_dim;
-    let mut result = vec![0.0f32; dim];
-    let scale = 1.0 / (head_dim as f32).sqrt();
-
-    for h in 0..n_heads {
-        let kv_h = h / heads_per_kv;
-        let q_off = h * head_dim;
-        let kv_off = kv_h * head_dim;
-
-        let mut scores = vec![0.0f32; pos + 1];
-        for t in 0..=pos {
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_data[q_off + d] * k_cache[t * kv_dim + kv_off + d];
-            }
-            scores[t] = dot * scale;
-        }
-
-        // Softmax
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - max).exp();
-            sum += *s;
-        }
-        for s in &mut scores {
-            *s /= sum;
-        }
-
-        for d in 0..head_dim {
-            let mut val = 0.0f32;
-            for t in 0..=pos {
-                val += scores[t] * v_cache[t * kv_dim + kv_off + d];
-            }
-            result[q_off + d] = val;
-        }
-    }
-
-    result
 }

@@ -35,5 +35,17 @@ pub trait Backend {
     fn add(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
     fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_id: u32);
     fn copy_into(&self, dst: &mut DeviceBuffer, src: &DeviceBuffer, dst_offset_elements: usize);
+    fn gqa_attention(
+        &self,
+        out: &mut DeviceBuffer,
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    );
     fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32>;
+    fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]);
 }

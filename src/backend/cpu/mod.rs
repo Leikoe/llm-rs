@@ -160,6 +160,63 @@ impl Backend for CpuBackend {
                     result[row] = sum;
                 }
             }
+            DType::Q4K => {
+                let w_data = get_cpu_data(weight);
+                let blocks_per_row = in_features / 256; // Q4K: 256 elements per block
+                for row in 0..out_features {
+                    let mut sum = 0.0f32;
+                    let row_block_offset = row * blocks_per_row * 144; // Q4K block = 144 bytes
+                    for b in 0..blocks_per_row {
+                        let bo = row_block_offset + b * 144;
+                        let d = f16::from_le_bytes([w_data[bo], w_data[bo + 1]]).to_f32();
+                        let dmin = f16::from_le_bytes([w_data[bo + 2], w_data[bo + 3]]).to_f32();
+                        let scales = &w_data[bo + 4..bo + 16];
+                        let qs = &w_data[bo + 16..bo + 144];
+
+                        for i in 0..256 {
+                            let sb = i / 32;
+                            let (sc, m) = unpack_q4k_scale(scales, sb);
+                            let group = i / 64;
+                            let j = i % 64;
+                            let q = if j < 32 {
+                                (qs[group * 32 + j] & 0x0F) as f32
+                            } else {
+                                (qs[group * 32 + j - 32] >> 4) as f32
+                            };
+                            let elem_idx = b * 256 + i;
+                            sum += (d * sc as f32 * q - dmin * m as f32) * input_f32[elem_idx];
+                        }
+                    }
+                    result[row] = sum;
+                }
+            }
+            DType::Q6K => {
+                let w_data = get_cpu_data(weight);
+                let blocks_per_row = in_features / 256; // Q6K: 256 elements per block
+                for row in 0..out_features {
+                    let mut sum = 0.0f32;
+                    let row_block_offset = row * blocks_per_row * 210; // Q6K block = 210 bytes
+                    for b in 0..blocks_per_row {
+                        let bo = row_block_offset + b * 210;
+                        let ql = &w_data[bo..bo + 128];
+                        let qh = &w_data[bo + 128..bo + 192];
+                        let scales = &w_data[bo + 192..bo + 208];
+                        let d = f16::from_le_bytes([w_data[bo + 208], w_data[bo + 209]]).to_f32();
+
+                        for sb in 0..16 {
+                            let sc = scales[sb] as i8 as f32;
+                            let d_sc = d * sc;
+                            for j in 0..16 {
+                                let elem = sb * 16 + j;
+                                let q = dequant_q6k_elem(ql, qh, elem);
+                                let idx = b * 256 + elem;
+                                sum += d_sc * (q as f32 - 32.0) * input_f32[idx];
+                            }
+                        }
+                    }
+                    result[row] = sum;
+                }
+            }
             _ => unimplemented!("matvec_mul not implemented for {:?}", weight.dtype),
         }
 
@@ -285,6 +342,68 @@ impl Backend for CpuBackend {
         dst_buf.data_mut()[offset_bytes..offset_bytes + len].copy_from_slice(src_data);
     }
 
+    fn gqa_attention(
+        &self,
+        out: &mut DeviceBuffer,
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        let q_data = self.read_to_vec_f32(q);
+        let k_data = self.read_to_vec_f32(k_cache);
+        let v_data = self.read_to_vec_f32(v_cache);
+
+        let kv_dim = n_kv_heads * head_dim;
+        let heads_per_kv = n_heads / n_kv_heads;
+        let dim = n_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut result = vec![0.0f32; dim];
+
+        for h in 0..n_heads {
+            let kv_h = h / heads_per_kv;
+            let q_off = h * head_dim;
+            let kv_off = kv_h * head_dim;
+
+            let mut scores = vec![0.0f32; pos + 1];
+            for t in 0..=pos {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[q_off + d] * k_data[t * kv_dim + kv_off + d];
+                }
+                scores[t] = dot * scale;
+            }
+
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            for s in &mut scores {
+                *s /= sum;
+            }
+
+            for d in 0..head_dim {
+                let mut val = 0.0f32;
+                for t in 0..=pos {
+                    val += scores[t] * v_data[t * kv_dim + kv_off + d];
+                }
+                result[q_off + d] = val;
+            }
+        }
+
+        write_f32_to_buffer(out, &result);
+    }
+
+    fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]) {
+        write_f32_to_buffer(buf, data);
+    }
+
     fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32> {
         let data = get_cpu_data(buf);
         match buf.dtype {
@@ -358,6 +477,42 @@ fn rope_inplace(buf: &mut DeviceBuffer, pos: usize, head_dim: usize, theta: f32)
     write_f32_to_buffer(buf, &data);
 }
 
+/// Unpack 6-bit sub-block scale and minimum from Q4_K's 12-byte scales array.
+/// Matches GGML's get_scale_min_k4.
+fn unpack_q4k_scale(scales: &[u8], sb: usize) -> (u8, u8) {
+    if sb < 4 {
+        (scales[sb] & 63, scales[sb + 4] & 63)
+    } else {
+        let sc = (scales[sb + 4] & 0x0F) | ((scales[sb - 4] >> 6) << 4);
+        let m = (scales[sb + 4] >> 4) | ((scales[sb] >> 6) << 4);
+        (sc, m)
+    }
+}
+
+/// Extract a 6-bit quantized value from Q6_K's ql/qh arrays for element index i (0..255).
+fn dequant_q6k_elem(ql: &[u8], qh: &[u8], i: usize) -> u8 {
+    let half = i / 128;
+    let j = i % 128;
+
+    let q_lo = if j < 64 {
+        ql[half * 64 + j] & 0x0F
+    } else {
+        ql[half * 64 + j - 64] >> 4
+    };
+
+    let q_hi = if j < 32 {
+        qh[half * 32 + j] & 3
+    } else if j < 64 {
+        (qh[half * 32 + j - 32] >> 2) & 3
+    } else if j < 96 {
+        (qh[half * 32 + j - 64] >> 4) & 3
+    } else {
+        (qh[half * 32 + j - 96] >> 6) & 3
+    };
+
+    q_lo | (q_hi << 4)
+}
+
 fn dequantize_to_f32(data: &[u8], dtype: DType, n_elements: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; n_elements];
     match dtype {
@@ -391,6 +546,45 @@ fn dequantize_to_f32(data: &[u8], dtype: DType, n_elements: usize) -> Vec<f32> {
                 for j in 0..32 {
                     let q = data[block_offset + 2 + j] as i8;
                     result[b * 32 + j] = scale * q as f32;
+                }
+            }
+        }
+        DType::Q4K => {
+            let n_blocks = n_elements / 256;
+            for b in 0..n_blocks {
+                let bo = b * 144;
+                let d = f16::from_le_bytes([data[bo], data[bo + 1]]).to_f32();
+                let dmin = f16::from_le_bytes([data[bo + 2], data[bo + 3]]).to_f32();
+                let scales = &data[bo + 4..bo + 16];
+                let qs = &data[bo + 16..bo + 144];
+
+                for i in 0..256 {
+                    let sb = i / 32;
+                    let (sc, m) = unpack_q4k_scale(scales, sb);
+                    let group = i / 64;
+                    let j = i % 64;
+                    let q = if j < 32 {
+                        (qs[group * 32 + j] & 0x0F) as f32
+                    } else {
+                        (qs[group * 32 + j - 32] >> 4) as f32
+                    };
+                    result[b * 256 + i] = d * sc as f32 * q - dmin * m as f32;
+                }
+            }
+        }
+        DType::Q6K => {
+            let n_blocks = n_elements / 256;
+            for b in 0..n_blocks {
+                let bo = b * 210;
+                let ql = &data[bo..bo + 128];
+                let qh = &data[bo + 128..bo + 192];
+                let scales = &data[bo + 192..bo + 208];
+                let d = f16::from_le_bytes([data[bo + 208], data[bo + 209]]).to_f32();
+
+                for i in 0..256 {
+                    let sc = scales[i / 16] as i8 as f32;
+                    let q = dequant_q6k_elem(ql, qh, i);
+                    result[b * 256 + i] = d * sc * (q as f32 - 32.0);
                 }
             }
         }
