@@ -64,7 +64,7 @@ impl MetalBackend {
             "matvec_q8_0_simd",
             "matvec_q4k_simd",
             "matvec_q6k_simd",
-            "gqa_attention",
+            "flash_attention",
         ];
 
         let mut pipelines = HashMap::new();
@@ -387,9 +387,11 @@ impl Backend for MetalBackend {
         head_dim: usize,
     ) {
         let kv_dim = (n_kv_heads * head_dim) as u32;
-        let shared_mem = (pos + 1 + 8) * 4; // scores + scratch
+        let fa_block = 32;
+        let n_simdgroups = (head_dim + 31) / 32;
+        let shared_mem = (fa_block + n_simdgroups) * 4;
         self.encode_groups(
-            "gqa_attention",
+            "flash_attention",
             sz(n_heads, 1, 1),
             sz(head_dim, 1, 1),
             shared_mem,

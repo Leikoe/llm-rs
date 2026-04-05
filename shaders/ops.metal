@@ -528,12 +528,26 @@ kernel void matvec_q6k_simd(
     if (lane == 0) output[row] = sum;
 }
 
-// ===================== GQA Attention =====================
-// One threadgroup per query head. Threadgroup size = head_dim.
-// Each thread handles one output dimension + a stripe of positions.
-// Shared memory: scores[seq_len] + scratch[n_simdgroups].
+// ===================== Flash Attention 2 =====================
+// One threadgroup per query head. Tiles over KV in blocks of FA_BLOCK positions.
+// Online softmax: maintains running max (m_i) and sum-of-exp (l_i) across tiles.
+// Shared memory: FA_BLOCK scores + scratch for reductions. O(1) in seq_len.
+// Each thread owns one output dimension and accumulates the weighted value sum.
+//
+// Algorithm (per head):
+//   o = 0, m = -inf, l = 0
+//   for each KV tile [t_start..t_end]:
+//     s[j] = dot(q, k[t_start+j]) * scale   (cooperative across threads)
+//     m_new = max(m, max(s))
+//     rescale = exp(m - m_new)
+//     o = o * rescale + sum(exp(s[j] - m_new) * v[t_start+j])
+//     l = l * rescale + sum(exp(s[j] - m_new))
+//     m = m_new
+//   output = o / l
 
-kernel void gqa_attention(
+constant constexpr uint FA_BLOCK = 32;
+
+kernel void flash_attention(
     device const float* q       [[buffer(0)]],
     device const float* k_cache [[buffer(1)]],
     device const float* v_cache [[buffer(2)]],
@@ -546,6 +560,8 @@ kernel void gqa_attention(
     uint head    [[threadgroup_position_in_grid]],
     uint d       [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
+    uint lane    [[thread_index_in_simdgroup]],
+    uint sg      [[simdgroup_index_in_threadgroup]],
     threadgroup float* shared   [[threadgroup(0)]])
 {
     uint heads_per_kv = n_heads / n_kv_heads;
@@ -554,67 +570,80 @@ kernel void gqa_attention(
     uint kv_off = kv_head * head_dim_c;
     float scale = rsqrt(float(head_dim_c));
     uint seq_len = pos + 1;
-
-    // Pointers into shared memory
-    threadgroup float* scores  = shared;
-    threadgroup float* scratch = shared + seq_len;
-
-    uint lane = d % 32;
-    uint sg   = d / 32;
     uint n_sg = (tg_size + 31) / 32;
 
-    // Phase 1: compute attention scores
-    for (uint t = d; t < seq_len; t += tg_size) {
-        float dot = 0.0;
-        for (uint i = 0; i < head_dim_c; i++)
-            dot += q[q_off + i] * k_cache[t * kv_dim + kv_off + i];
-        scores[t] = dot * scale;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Shared memory: [FA_BLOCK scores] [n_sg scratch]
+    threadgroup float* scores  = shared;
+    threadgroup float* scratch = shared + FA_BLOCK;
 
-    // Phase 2: softmax -- find max
-    float m = -INFINITY;
-    for (uint t = d; t < seq_len; t += tg_size) m = max(m, scores[t]);
-    m = simd_max(m);
-    if (lane == 0) scratch[sg] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float v = (lane < n_sg) ? scratch[lane] : -INFINITY;
-        v = simd_max(v);
-        if (lane == 0) scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float max_val = scratch[0];
+    // Per-thread accumulators (each thread owns dimension d < head_dim)
+    float o_acc = 0.0;
+    float m_i = -INFINITY;
+    float l_i = 0.0;
 
-    // exp + sum
-    float s = 0.0;
-    for (uint t = d; t < seq_len; t += tg_size) {
-        float v = exp(scores[t] - max_val);
-        scores[t] = v;
-        s += v;
-    }
-    s = simd_sum(s);
-    if (lane == 0) scratch[sg] = s;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float v = (lane < n_sg) ? scratch[lane] : 0.0;
-        v = simd_sum(v);
-        if (lane == 0) scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = scratch[0];
+    for (uint t_start = 0; t_start < seq_len; t_start += FA_BLOCK) {
+        uint t_end = min(t_start + FA_BLOCK, seq_len);
+        uint tile_len = t_end - t_start;
 
-    // normalize
-    for (uint t = d; t < seq_len; t += tg_size) scores[t] /= total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Phase 1: cooperatively compute dot(q, k) for this tile
+        for (uint j = d; j < tile_len; j += tg_size) {
+            float dot = 0.0;
+            for (uint i = 0; i < head_dim_c; i++)
+                dot += q[q_off + i] * k_cache[(t_start + j) * kv_dim + kv_off + i];
+            scores[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: weighted value sum -- one thread per dimension
-    if (d < head_dim_c) {
-        float acc = 0.0;
-        for (uint t = 0; t < seq_len; t++)
-            acc += scores[t] * v_cache[t * kv_dim + kv_off + d];
-        output[q_off + d] = acc;
+        // Phase 2: find tile max
+        float tile_max = -INFINITY;
+        for (uint j = d; j < tile_len; j += tg_size)
+            tile_max = max(tile_max, scores[j]);
+        tile_max = simd_max(tile_max);
+        if (lane == 0) scratch[sg] = tile_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float v = (lane < n_sg) ? scratch[lane] : -INFINITY;
+            v = simd_max(v);
+            if (lane == 0) scratch[0] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_max = scratch[0];
+
+        // Phase 3: online softmax rescale
+        float m_new = max(m_i, tile_max);
+        float rescale = exp(m_i - m_new);
+        o_acc *= rescale;
+        l_i *= rescale;
+
+        // Compute exp(score - m_new) and tile sum
+        float tile_sum = 0.0;
+        for (uint j = d; j < tile_len; j += tg_size) {
+            float e = exp(scores[j] - m_new);
+            scores[j] = e;
+            tile_sum += e;
+        }
+        tile_sum = simd_sum(tile_sum);
+        if (lane == 0) scratch[sg] = tile_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float v = (lane < n_sg) ? scratch[lane] : 0.0;
+            v = simd_sum(v);
+            if (lane == 0) scratch[0] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        l_i += scratch[0];
+        m_i = m_new;
+
+        // Phase 4: accumulate weighted values
+        if (d < head_dim_c) {
+            for (uint j = 0; j < tile_len; j++)
+                o_acc += scores[j] * v_cache[(t_start + j) * kv_dim + kv_off + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
+    if (d < head_dim_c)
+        output[q_off + d] = o_acc / l_i;
 }
 
 // ===================== RMS Norm =====================
