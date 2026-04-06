@@ -4,9 +4,9 @@ use crate::tensor::DType;
 
 /// Per-layer key/value cache for autoregressive generation.
 pub struct KVCache {
-    /// Per-layer key cache: flat [max_seq_len * kv_dim] as f32.
+    /// Per-layer key cache: flat [max_seq_len * kv_dim] as bf16.
     pub k_cache: Vec<DeviceBuffer>,
-    /// Per-layer value cache: flat [max_seq_len * kv_dim] as f32.
+    /// Per-layer value cache: flat [max_seq_len * kv_dim] as bf16.
     pub v_cache: Vec<DeviceBuffer>,
     pub kv_dim: usize,
     pub max_seq_len: usize,
@@ -21,11 +21,11 @@ impl KVCache {
         for _ in 0..config.n_layers {
             k_cache.push(backend.alloc(
                 &[config.max_seq_len as u64, kv_dim as u64],
-                DType::F32,
+                DType::BF16,
             ));
             v_cache.push(backend.alloc(
                 &[config.max_seq_len as u64, kv_dim as u64],
-                DType::F32,
+                DType::BF16,
             ));
         }
 

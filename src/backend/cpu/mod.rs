@@ -400,6 +400,22 @@ impl Backend for CpuBackend {
         write_f32_to_buffer(out, &result);
     }
 
+    fn embed_batch(&self, _out: &mut DeviceBuffer, _table: &DeviceBuffer, _token_ids: &[u32]) {
+        unimplemented!("CPU embed_batch not yet implemented");
+    }
+
+    fn rms_norm_batch(&self, _out: &mut DeviceBuffer, _input: &DeviceBuffer, _weight: &DeviceBuffer, _eps: f32, _seq_len: usize) {
+        unimplemented!("CPU rms_norm_batch not yet implemented");
+    }
+
+    fn rope_batch(&self, _q: &mut DeviceBuffer, _k: &mut DeviceBuffer, _start_pos: usize, _seq_len: usize, _head_dim: usize, _rope_theta: f32) {
+        unimplemented!("CPU rope_batch not yet implemented");
+    }
+
+    fn gqa_attention_batch(&self, _out: &mut DeviceBuffer, _q: &DeviceBuffer, _k_cache: &DeviceBuffer, _v_cache: &DeviceBuffer, _start_pos: usize, _seq_len: usize, _n_heads: usize, _n_kv_heads: usize, _head_dim: usize) {
+        unimplemented!("CPU gqa_attention_batch not yet implemented");
+    }
+
     fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]) {
         write_f32_to_buffer(buf, data);
     }
@@ -438,11 +454,21 @@ pub fn write_f32_to_buffer(buf: &mut DeviceBuffer, data: &[f32]) {
     let cpu_buf = buf.inner.downcast_mut::<CpuBuffer>().unwrap();
     let vec = cpu_buf.data_mut();
     vec.clear();
-    vec.reserve(data.len() * 4);
-    for &v in data {
-        vec.extend_from_slice(&v.to_le_bytes());
+    match buf.dtype {
+        DType::BF16 => {
+            vec.reserve(data.len() * 2);
+            for &v in data {
+                vec.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+            }
+        }
+        _ => {
+            vec.reserve(data.len() * 4);
+            for &v in data {
+                vec.extend_from_slice(&v.to_le_bytes());
+            }
+            buf.dtype = DType::F32;
+        }
     }
-    buf.dtype = DType::F32;
 }
 
 fn rope_inplace(buf: &mut DeviceBuffer, pos: usize, head_dim: usize, theta: f32) {

@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(metal_precompiled)");
     #[cfg(target_os = "macos")]
     compile_metal_shaders();
 }
@@ -29,8 +30,9 @@ fn compile_metal_shaders() {
         return;
     }
 
-    // Precompile shaders for build-time validation.
-    // Not required at runtime (we compile from source via newLibraryWithSource).
+    // Compile .metal -> .air -> .metallib ahead of time.
+    // The .metallib is embedded in the binary and loaded at runtime,
+    // avoiding any source-level JIT compilation.
     let mut air_files = Vec::new();
     for entry in &metal_files {
         let path = entry.path();
@@ -44,14 +46,15 @@ fn compile_metal_shaders() {
                 path.to_str().unwrap(),
                 "-o",
                 &air_path,
-                "-std=metal3.0",
+                "-std=metal4.0",
+                "-O2",
             ])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
 
         if !ok {
-            println!("cargo:warning=Metal shader precompilation skipped (install Metal toolchain for build-time validation)");
+            println!("cargo:warning=Metal shader compilation failed — will JIT from source at runtime");
             return;
         }
 
@@ -67,6 +70,10 @@ fn compile_metal_shaders() {
     }
 
     if !cmd.status().map(|s| s.success()).unwrap_or(false) {
-        println!("cargo:warning=Metal library linking failed");
+        println!("cargo:warning=Metal library linking failed — will JIT from source at runtime");
+        return;
     }
+
+    // Signal to the runtime that we have a pre-compiled metallib
+    println!("cargo:rustc-cfg=metal_precompiled");
 }

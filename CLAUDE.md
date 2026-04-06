@@ -14,7 +14,7 @@ High-performance LLM inference engine in Rust targeting Apple Metal (primary) an
 - **Models:** LLaMA family (LLaMA 3.x, Mistral) -- dense only
 - **Weights:** GGUF format, direct file read
 - **Quantizations:** BF16, FP16, F32, Q4_0, Q8_0, Q4_K, Q6_K
-- **Backend:** Metal (primary, ~50 tok/s 1B, ~9 tok/s 8B), CPU fallback
+- **Backend:** Metal (primary, ~62 tok/s 1B BF16, ~11.5 tok/s 8B Q4_K), CPU fallback
 - **CLI:** Interactive chat + single-shot completion
 - **Tokenizer:** BPE from GGUF metadata, GPT-2 byte-level encoding with special token support (no external crate)
 
@@ -27,8 +27,9 @@ High-performance LLM inference engine in Rust targeting Apple Metal (primary) an
 - `src/kv_cache/` -- Per-layer KV cache, flat [max_seq_len, kv_dim] buffers
 - `src/sampler/` -- Temperature, top-k, top-p, custom xorshift64 PRNG
 - `src/cli/` -- Clap-based CLI: `complete` and `chat` subcommands
-- `shaders/` -- Metal compute shaders (ops.metal: embed, matvec, SIMD matvec, rms_norm, rope, softmax, silu, elementwise, GQA attention)
-- `build.rs` -- Metal shader compilation (.metal -> .air -> .metallib via xcrun)
+- `shaders/` -- Metal compute shaders (ops.metal: embed, matvec, SIMD matvec with multi-row+register caching, rms_norm, rope, softmax, silu, elementwise, flash attention)
+- `build.rs` -- AOT Metal shader compilation (.metal -> .air -> .metallib via xcrun metal4.0, embedded in binary)
+- `scripts/` -- Profiling tools (profile.py: parse Metal System Trace from xctrace)
 
 ## Key Design Decisions
 
@@ -96,9 +97,10 @@ Flat `[max_seq_len, kv_dim]` buffer per layer per K/V. Write at `pos * kv_dim`, 
 ### Metal Performance Strategy (Phase 2)
 1. Pre-allocate all activation buffers at init -- zero allocations during inference
 2. Encode entire forward pass into single `MTLCommandBuffer` with `memoryBarrier` between dependent dispatches, `commit()` once, `waitUntilCompleted()` only after logits readback
-3. BF16/FP16 inputs with FP32 accumulation in matmul kernels
-4. Quantized matvec: SIMD group reductions for memory bandwidth
-5. Prefill (seq_len > 1): GEMM; consider MPS for FP16
+3. AOT shader compilation: `.metal` → `.air` → `.metallib` at build time (metal4.0, -O2), embedded in binary via `include_bytes!`, loaded with `newLibraryWithURL` — zero source JIT at runtime
+4. Multi-row SIMD matvec: NR=2 rows per simdgroup with register-cached input (amortizes input reads across rows). Float4 wide loads for BF16/F16. Paired nibble processing for Q4_K.
+5. BF16 matvec: 167 GB/s (84% SOL), Q4_K: 53 GB/s (27% SOL), Q6_K: 62 GB/s (31% SOL) on M1 Pro
+6. `LLM_PERF=1` env var enables per-kernel GPU timing via `MTLCommandBuffer.GPUStartTime()/GPUEndTime()` with BW and FLOPS vs SOL reporting
 
 ### CPU Backend
 Accelerate BLAS for FP32 matmul, NEON SIMD for quantized dot products. BF16/FP16 with FP32 accumulation via AMX coprocessor.
@@ -109,6 +111,27 @@ cargo build --release
 ./target/release/llm-rs -m models/Llama-3.2-1B-Instruct-BF16.gguf complete -p "Hello" -n 30 --temperature 0
 ./target/release/llm-rs -m models/Llama-3.1-8B-Instruct-Q4_K_M.gguf chat
 ```
+
+## Profiling (Metal GPU)
+```bash
+# Capture a Metal System Trace (opens in Instruments)
+xcrun xctrace record --template 'Metal System Trace' --output /tmp/llm-rs-profile.trace \
+  --launch -- ./target/release/llm-rs -m models/Llama-3.2-1B-Instruct-BF16.gguf complete -p "Hello" -n 10 --temperature 0
+open /tmp/llm-rs-profile.trace
+
+# Export trace data from CLI (no Instruments UI needed)
+# Table of contents (list all available tables):
+xctrace export --input /tmp/llm-rs-profile.trace --toc
+# Per-command-buffer GPU timing:
+xctrace export --input /tmp/llm-rs-profile.trace --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-application-intervals"]'
+# Per-encoder timing:
+xctrace export --input /tmp/llm-rs-profile.trace --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-application-encoders-list"]'
+# GPU execution intervals:
+xctrace export --input /tmp/llm-rs-profile.trace --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]'
+# Shader list (kernel names + binary sizes):
+xctrace export --input /tmp/llm-rs-profile.trace --xpath '/trace-toc/run[@number="1"]/data/table[@schema="metal-shader-profiler-shader-list"]'
+```
+Note: Per-kernel GPU timing requires enabling "Shader Timeline" in the Metal Application instrument settings within Instruments.app.
 
 ## Implementation Phases
 
@@ -122,20 +145,21 @@ cargo build --release
 - Validated on LLaMA 3.2 1B Instruct BF16 (~0.7 tok/s CPU)
 
 ### Phase 2: Metal (done)
-- MetalBackend: device, queue, runtime shader compilation, pipeline cache
-- SIMD matvec kernels (32-lane cooperative dot products via simd_sum)
-- GPU GQA attention kernel (eliminates per-layer GPU round-trips)
+- MetalBackend: device, queue, AOT shader compilation (metal4.0), pipeline cache
+- Multi-row SIMD matvec kernels (NR=2 rows/simdgroup, register-cached input, float4 loads for BF16/F16)
+- Flash Attention 2 GPU kernel (online softmax, eliminates per-layer GPU round-trips)
 - Lazy command buffer batching (single MTLCommandBuffer per forward pass)
 - Q4_K and Q6_K quantization support (CPU + Metal)
 - Prefill optimization (skip output projection for non-final tokens)
 - Chat template with special token encoding for LLaMA 3
-- 1B BF16: ~50 tok/s, 8B Q4_K_M: ~9 tok/s on M1 Pro
+- Per-kernel GPU profiling (LLM_PERF=1, GPU timestamps, BW/FLOPS vs SOL)
+- 1B BF16: ~62 tok/s (167 GB/s, 84% SOL), 8B Q4_K_M: ~11.5 tok/s on M1 Pro
 
 ### Phase 3: Polish (next)
 - Error handling (replace panics with `Result`)
-- Performance profiling with Instruments
 - Batched prefill (GEMM instead of sequential matvec)
 - CPU backend optimization (Accelerate BLAS, NEON SIMD)
+- MTLBinaryArchive for full GPU ISA pre-compilation (eliminate first-run deferred compilation)
 
 ## Verification
 1. **GGUF parser:** tensor count/shapes/metadata match llama.cpp output

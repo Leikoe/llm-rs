@@ -52,11 +52,11 @@ fn run_completion(
     tokens.extend(tokenizer.encode(prompt));
     eprintln!("Prompt tokens: {}", tokens.len());
 
-    // Prefill: process all prompt tokens except the last.
+    // Prefill: batch all prompt tokens except the last through GEMM.
     // Then forward the last token to get the first set of logits.
     let start = Instant::now();
-    for (i, &token) in tokens.iter().enumerate().take(tokens.len().saturating_sub(1)) {
-        model.forward_kv_only(backend, token, i);
+    if tokens.len() > 1 {
+        model.forward_prefill(backend, &tokens[..tokens.len() - 1], 0);
     }
     let last_prompt_pos = tokens.len() - 1;
     let mut logits = model.forward(backend, tokens[last_prompt_pos], last_prompt_pos);
@@ -148,10 +148,10 @@ fn run_chat(
         );
         let user_tokens = tokenizer.encode(&user_text);
 
-        // Prefill user message (all but last token)
-        for &token in user_tokens.iter().take(user_tokens.len().saturating_sub(1)) {
-            model.forward_kv_only(backend, token, pos);
-            pos += 1;
+        // Prefill user message (all but last token) with batched GEMM
+        if user_tokens.len() > 1 {
+            model.forward_prefill(backend, &user_tokens[..user_tokens.len() - 1], pos);
+            pos += user_tokens.len() - 1;
         }
 
         // Forward last user token to get initial logits

@@ -48,4 +48,24 @@ pub trait Backend {
     );
     fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32>;
     fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]);
+
+    // Batched ops for prefill
+    fn embed_batch(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_ids: &[u32]);
+    fn rms_norm_batch(&self, out: &mut DeviceBuffer, input: &DeviceBuffer, weight: &DeviceBuffer, eps: f32, seq_len: usize);
+    fn rope_batch(&self, q: &mut DeviceBuffer, k: &mut DeviceBuffer, start_pos: usize, seq_len: usize, head_dim: usize, rope_theta: f32);
+    fn gqa_attention_batch(
+        &self,
+        out: &mut DeviceBuffer,
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        start_pos: usize,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    );
+
+    /// Ensure all previously enqueued GPU work is complete.
+    fn sync(&self) {}
 }
