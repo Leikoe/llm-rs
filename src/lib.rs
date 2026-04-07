@@ -1,3 +1,4 @@
+pub mod arch;
 pub mod backend;
 pub mod cli;
 pub mod gguf;

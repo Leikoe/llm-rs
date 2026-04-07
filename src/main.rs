@@ -7,7 +7,8 @@ use llm_rs::backend::Backend;
 use llm_rs::backend::metal::MetalBackend;
 use llm_rs::cli::{Cli, Command};
 use llm_rs::gguf::GgufFile;
-use llm_rs::model::llama::{LlamaModel, Session};
+use llm_rs::arch;
+use llm_rs::model::{Session, Transformer};
 use llm_rs::sampler::{Sampler, SamplerConfig};
 
 use llm_rs::tokenizer::Tokenizer;
@@ -25,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli) {
-    let model = LlamaModel::from_gguf(gguf, backend);
+    let model = arch::load(gguf, backend);
 
     match cli.command {
         Command::Complete {
@@ -60,7 +61,7 @@ fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli
 
 fn run_completion<B: Backend>(
     backend: &B,
-    model: &LlamaModel<B>,
+    model: &Transformer<B>,
     session: &mut Session<B>,
     tokenizer: &Tokenizer,
     prompt: &str,
@@ -125,7 +126,7 @@ fn run_completion<B: Backend>(
 
 fn run_chat<B: Backend>(
     backend: &B,
-    model: &LlamaModel<B>,
+    model: &Transformer<B>,
     session: &mut Session<B>,
     tokenizer: &Tokenizer,
     system_prompt: Option<&str>,
