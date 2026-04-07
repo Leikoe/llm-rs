@@ -1,3 +1,6 @@
 /target
 /models
 .claude/
+/vllm
+/notes
+

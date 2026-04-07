@@ -38,8 +38,8 @@ back on growth that doesn't pay for itself.
 
 | Metric                       | Current | Soft cap |
 |------------------------------|---------|----------|
-| Rust LOC (`src/**/*.rs`)     |   2651  |   6000   |
-| Metal LOC (`shaders/*.metal`)|   1498  |   3000   |
+| Rust LOC (`src/**/*.rs`)     |   2548  |   6000   |
+| Metal LOC (`shaders/*.metal`)|    949  |   3000   |
 | Non-Apple deps (Cargo.toml)  |     3   |     5    |
 
 When you cross a soft cap, stop and ask whether the new code is paying for
