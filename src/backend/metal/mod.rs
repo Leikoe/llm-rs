@@ -10,7 +10,15 @@ use objc2_metal::*;
 use crate::backend::{Backend, DeviceBuffer};
 use crate::tensor::{DType, TensorView};
 
-struct MetalBuffer(Retained<ProtocolObject<dyn MTLBuffer>>);
+struct MetalBuffer {
+    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Byte offset of the logical data within `buf`. Non-zero only for zero-copy
+    /// weight uploads where the underlying GGUF tensor isn't page-aligned and we
+    /// wrapped a page-rounded-down region.
+    offset: usize,
+}
+
+const PAGE_SIZE: usize = 16384;
 
 /// Load the pre-compiled Metal library (.metallib) embedded at build time.
 /// Falls back to runtime source compilation if the Metal toolchain wasn't available.
@@ -323,8 +331,8 @@ unsafe fn set_buf(
     buf: &DeviceBuffer,
     idx: usize,
 ) {
-    let m = &buf.inner.downcast_ref::<MetalBuffer>().unwrap().0;
-    unsafe { enc.setBuffer_offset_atIndex(Some(m), 0, idx) };
+    let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
+    unsafe { enc.setBuffer_offset_atIndex(Some(&m.buf), m.offset, idx) };
 }
 
 unsafe fn set_u32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: u32, idx: usize) {
@@ -349,16 +357,28 @@ unsafe fn set_f32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: f32, 
 
 impl Backend for MetalBackend {
     fn upload_tensor(&self, tv: &TensorView) -> DeviceBuffer {
+        // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
+        // means the GPU sees the same memory the CPU loaded the file into.
+        // Metal requires the pointer to be page-aligned and the length to be a page
+        // multiple, so we round the start down to the nearest page and pass an
+        // in-page byte offset on every binding. The trailing pages of the GGUF
+        // allocation are valid (page-padded by AlignedBuf) so the rounded-up length
+        // never reads past the end.
+        let ptr = tv.data.as_ptr() as usize;
+        let aligned = ptr & !(PAGE_SIZE - 1);
+        let offset = ptr - aligned;
+        let length = (offset + tv.data.len() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let buf = unsafe {
-            self.device.newBufferWithBytes_length_options(
-                NonNull::new_unchecked(tv.data.as_ptr() as *mut _),
-                tv.data.len(),
+            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
+                NonNull::new_unchecked(aligned as *mut _),
+                length,
                 MTLResourceOptions::StorageModeShared,
+                None, // GGUF buffer outlives the model — Metal must not free it.
             )
         }
-        .expect("Failed to create buffer");
+        .expect("Failed to create no-copy buffer");
         DeviceBuffer {
-            inner: Box::new(MetalBuffer(buf)),
+            inner: Box::new(MetalBuffer { buf, offset }),
             dtype: tv.dtype,
             shape: tv.shape.clone(),
         }
@@ -372,7 +392,7 @@ impl Backend for MetalBackend {
             .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
             .expect("Failed to alloc buffer");
         DeviceBuffer {
-            inner: Box::new(MetalBuffer(buf)),
+            inner: Box::new(MetalBuffer { buf, offset: 0 }),
             dtype,
             shape: shape.to_vec(),
         }
@@ -500,8 +520,9 @@ impl Backend for MetalBackend {
             let groups = sz(n_tg, 1, 1);
             let tg = sz(nsg * 32, 1, 1);
 
-            let in_mtl = &input.inner.downcast_ref::<MetalBuffer>().unwrap().0;
-            let out_mtl = &out.inner.downcast_ref::<MetalBuffer>().unwrap().0;
+            let in_m = input.inner.downcast_ref::<MetalBuffer>().unwrap();
+            let out_m = out.inner.downcast_ref::<MetalBuffer>().unwrap();
+            let w_m = weight.inner.downcast_ref::<MetalBuffer>().unwrap();
 
             let mut state = self.cmd.borrow_mut();
             let s = state.get_or_insert_with(|| {
@@ -510,17 +531,16 @@ impl Backend for MetalBackend {
                 CmdState { cmd_buf: cb, encoder: enc }
             });
             let pso = &self.pipelines[kernel];
-            let w_mtl = &weight.inner.downcast_ref::<MetalBuffer>().unwrap().0;
 
             unsafe {
                 s.encoder.setComputePipelineState(pso);
-                s.encoder.setBuffer_offset_atIndex(Some(w_mtl), 0, 0);
+                s.encoder.setBuffer_offset_atIndex(Some(&w_m.buf), w_m.offset, 0);
                 set_u32(&s.encoder, in_f, 3);
                 set_u32(&s.encoder, out_f, 4);
 
                 for pos in 0..seq_len as usize {
-                    s.encoder.setBuffer_offset_atIndex(Some(in_mtl), pos * in_stride, 1);
-                    s.encoder.setBuffer_offset_atIndex(Some(out_mtl), pos * out_stride, 2);
+                    s.encoder.setBuffer_offset_atIndex(Some(&in_m.buf), in_m.offset + pos * in_stride, 1);
+                    s.encoder.setBuffer_offset_atIndex(Some(&out_m.buf), out_m.offset + pos * out_stride, 2);
                     s.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
                 }
                 s.encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -735,16 +755,17 @@ impl Backend for MetalBackend {
         } else {
             self.flush();
         }
-        let m = &buf.inner.downcast_ref::<MetalBuffer>().unwrap().0;
+        let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
         let n = buf.n_elements();
+        let base = unsafe { (m.buf.contents().as_ptr() as *const u8).add(m.offset) };
         match buf.dtype {
             DType::BF16 => {
-                let ptr = m.contents().as_ptr() as *const u16;
+                let ptr = base as *const u16;
                 let raw = unsafe { std::slice::from_raw_parts(ptr, n) };
                 raw.iter().map(|&bits| f32::from_bits((bits as u32) << 16)).collect()
             }
             _ => {
-                let ptr = m.contents().as_ptr() as *const f32;
+                let ptr = base as *const f32;
                 unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
             }
         }
@@ -903,16 +924,17 @@ impl Backend for MetalBackend {
 
     fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]) {
         self.flush();
-        let m = &buf.inner.downcast_ref::<MetalBuffer>().unwrap().0;
+        let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
+        let base = unsafe { (m.buf.contents().as_ptr() as *mut u8).add(m.offset) };
         match buf.dtype {
             DType::BF16 => {
-                let ptr = m.contents().as_ptr() as *mut u16;
+                let ptr = base as *mut u16;
                 for (i, &val) in data.iter().enumerate() {
                     unsafe { *ptr.add(i) = (val.to_bits() >> 16) as u16; }
                 }
             }
             _ => {
-                let ptr = m.contents().as_ptr() as *mut f32;
+                let ptr = base as *mut f32;
                 unsafe {
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
                 }

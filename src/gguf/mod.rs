@@ -29,11 +29,63 @@ impl TensorInfo {
     }
 }
 
+/// Page-aligned, page-padded heap buffer backed by an anonymous mmap.
+/// The base pointer is 16KB-aligned and the allocation length is rounded up
+/// to a page multiple, so Metal's `newBufferWithBytesNoCopy` can wrap any
+/// page-aligned subregion safely (the trailing pages are valid memory).
+pub struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,        // logical length (file size)
+    mmap_len: usize,   // physical mapping length (multiple of PAGE_SIZE)
+}
+
+const PAGE_SIZE: usize = 16384;
+
+impl AlignedBuf {
+    fn alloc(len: usize) -> io::Result<Self> {
+        let mmap_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mmap_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(AlignedBuf { ptr: ptr as *mut u8, len, mmap_len })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr }
+
+    /// Total mapped length (page-padded). The region [ptr, ptr+mmap_len) is
+    /// all valid memory — needed for Metal to safely wrap with newBufferWithBytesNoCopy.
+    pub fn mmap_len(&self) -> usize { self.mmap_len }
+    pub fn base_ptr(&self) -> *const u8 { self.ptr }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut _, self.mmap_len); }
+    }
+}
+
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+
 pub struct GgufFile {
     pub version: u32,
     pub metadata: HashMap<String, MetadataValue>,
     pub tensors: Vec<TensorInfo>,
-    data: Vec<u8>,
+    data: AlignedBuf,
     data_offset: usize,
 }
 
@@ -82,7 +134,7 @@ impl GgufFile {
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!("Read {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
-        let mut cursor = Cursor::new(&data[..]);
+        let mut cursor = Cursor::new(data.as_slice());
 
         let magic = cursor.read_u32::<LittleEndian>()?;
         if magic != GGUF_MAGIC {
@@ -125,6 +177,12 @@ impl GgufFile {
         Ok(GgufFile { version, metadata, tensors, data, data_offset })
     }
 
+    /// Page-aligned base pointer of the underlying allocation. Length is page-padded.
+    /// Used by the Metal backend for zero-copy tensor uploads via newBufferWithBytesNoCopy.
+    pub fn aligned_base(&self) -> (*const u8, usize) {
+        (self.data.base_ptr(), self.data.mmap_len())
+    }
+
     pub fn tensor_view(&self, name: &str) -> Result<TensorView<'_>, GgufError> {
         let info = self.tensors.iter().find(|t| t.name == name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
@@ -134,7 +192,7 @@ impl GgufFile {
             name: info.name.clone(),
             dtype: info.dtype,
             shape: info.shape.clone(),
-            data: &self.data[start..start + size],
+            data: &self.data.as_slice()[start..start + size],
         })
     }
 }
@@ -197,11 +255,9 @@ fn read_metadata_array(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue, Gguf
 
 /// Parallel pread to saturate NVMe queue depth.
 /// ~5 GB/s cold (SSD-bound), ~18 GB/s warm (4x over single-threaded read_exact).
-fn read_file_fast(file: &File, size: usize) -> io::Result<Vec<u8>> {
+fn read_file_fast(file: &File, size: usize) -> io::Result<AlignedBuf> {
     let fd = file.as_raw_fd();
-    let mut data: Vec<u8> = Vec::with_capacity(size);
-    // SAFETY: pread fills every byte before anything reads it
-    unsafe { data.set_len(size); }
+    let mut data = AlignedBuf::alloc(size)?;
 
     const N_THREADS: usize = 8;
     const CHUNK: usize = 4 * 1024 * 1024;

@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use clap::Parser;
 
+use llm_rs::backend::Backend;
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
 use llm_rs::backend::cpu::CpuBackend;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use llm_rs::backend::metal::MetalBackend;
-use llm_rs::backend::Backend;
 use llm_rs::cli::{Cli, Command};
 use llm_rs::gguf::GgufFile;
 use llm_rs::model::llama::LlamaModel;
@@ -29,11 +29,28 @@ fn main() {
     let mut model = LlamaModel::from_gguf(&gguf, &backend);
 
     match cli.command {
-        Command::Complete { prompt, max_tokens, sampling } => {
-            run_completion(&backend, &mut model, &tokenizer, &prompt, max_tokens, sampling.to_config());
+        Command::Complete {
+            prompt,
+            max_tokens,
+            sampling,
+        } => {
+            run_completion(
+                &backend,
+                &mut model,
+                &tokenizer,
+                &prompt,
+                max_tokens,
+                sampling.to_config(),
+            );
         }
         Command::Chat { system, sampling } => {
-            run_chat(&backend, &mut model, &tokenizer, system.as_deref(), sampling.to_config());
+            run_chat(
+                &backend,
+                &mut model,
+                &tokenizer,
+                system.as_deref(),
+                sampling.to_config(),
+            );
         }
     }
 }
@@ -77,7 +94,10 @@ fn run_completion(
     loop {
         let next_token = sampler.sample(&mut logits);
 
-        if next_token == tokenizer.eos_id || tokenizer.eot_id == Some(next_token) || generated >= max_tokens {
+        if next_token == tokenizer.eos_id
+            || tokenizer.eot_id == Some(next_token)
+            || generated >= max_tokens
+        {
             break;
         }
 
@@ -117,9 +137,7 @@ fn run_chat(
 
     // System prompt
     if let Some(sys) = system_prompt {
-        let sys_text = format!(
-            "<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>"
-        );
+        let sys_text = format!("<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>");
         let sys_tokens = tokenizer.encode(&sys_text);
         for &token in &sys_tokens {
             model.forward_kv_only(backend, token, pos);
