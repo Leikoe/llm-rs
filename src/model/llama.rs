@@ -23,6 +23,7 @@ pub struct LlamaWeights {
     pub layers: Vec<LlamaLayerWeights>,
 }
 
+/// Per-step scratch buffers, sized for one token. Reused across every forward call.
 struct Activations {
     x: DeviceBuffer,
     x_norm: DeviceBuffer,
@@ -39,11 +40,51 @@ struct Activations {
     logits: DeviceBuffer,
 }
 
+impl Activations {
+    fn new(backend: &dyn Backend, config: &ModelConfig) -> Self {
+        let dim = config.dim as u64;
+        let kv_dim = (config.n_kv_heads * config.head_dim) as u64;
+        let hidden_dim = config.hidden_dim as u64;
+        Activations {
+            x: backend.alloc(&[dim], DType::BF16),
+            x_norm: backend.alloc(&[dim], DType::BF16),
+            q: backend.alloc(&[dim], DType::BF16),
+            k: backend.alloc(&[kv_dim], DType::BF16),
+            v: backend.alloc(&[kv_dim], DType::BF16),
+            attn_out: backend.alloc(&[dim], DType::BF16),
+            wo_out: backend.alloc(&[dim], DType::BF16),
+            x2: backend.alloc(&[dim], DType::BF16),
+            gate: backend.alloc(&[hidden_dim], DType::BF16),
+            up: backend.alloc(&[hidden_dim], DType::BF16),
+            gate_up: backend.alloc(&[hidden_dim], DType::BF16),
+            ffn_out: backend.alloc(&[dim], DType::BF16),
+            logits: backend.alloc(&[config.vocab_size as u64], DType::BF16),
+        }
+    }
+}
+
+/// Immutable model: weights + config. Shareable across sessions.
 pub struct LlamaModel {
     pub config: ModelConfig,
     pub weights: LlamaWeights,
+}
+
+/// Per-request mutable state: KV cache, current position, scratch activations.
+/// One session = one conversation. Independent of the model.
+pub struct Session {
     pub kv_cache: KVCache,
+    pub pos: usize,
     act: Activations,
+}
+
+impl Session {
+    pub fn new(backend: &dyn Backend, config: &ModelConfig) -> Self {
+        Session {
+            kv_cache: KVCache::new(backend, config),
+            pos: 0,
+            act: Activations::new(backend, config),
+        }
+    }
 }
 
 impl LlamaModel {
@@ -97,28 +138,6 @@ impl LlamaModel {
         let gb = bytes_uploaded as f64 / (1024.0 * 1024.0 * 1024.0);
         eprintln!("Uploaded model weights to backend: {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
-        let kv_cache = KVCache::new(backend, &config);
-
-        let dim = config.dim as u64;
-        let kv_dim = (config.n_kv_heads * config.head_dim) as u64;
-        let hidden_dim = config.hidden_dim as u64;
-
-        let act = Activations {
-            x: backend.alloc(&[dim], DType::BF16),
-            x_norm: backend.alloc(&[dim], DType::BF16),
-            q: backend.alloc(&[dim], DType::BF16),
-            k: backend.alloc(&[kv_dim], DType::BF16),
-            v: backend.alloc(&[kv_dim], DType::BF16),
-            attn_out: backend.alloc(&[dim], DType::BF16),
-            wo_out: backend.alloc(&[dim], DType::BF16),
-            x2: backend.alloc(&[dim], DType::BF16),
-            gate: backend.alloc(&[hidden_dim], DType::BF16),
-            up: backend.alloc(&[hidden_dim], DType::BF16),
-            gate_up: backend.alloc(&[hidden_dim], DType::BF16),
-            ffn_out: backend.alloc(&[dim], DType::BF16),
-            logits: backend.alloc(&[config.vocab_size as u64], DType::BF16),
-        };
-
         LlamaModel {
             config,
             weights: LlamaWeights {
@@ -127,27 +146,28 @@ impl LlamaModel {
                 output_weight,
                 layers,
             },
-            kv_cache,
-            act,
         }
     }
 
-    /// Run `tokens` starting at `start_pos` through all layers and populate the KV cache.
-    /// Returns logits for the last token if `want_logits` is true, otherwise `None`.
+    /// Run `tokens` starting at `session.pos` through all layers and populate the KV cache.
+    /// Advances `session.pos` by `tokens.len()`. Returns logits for the last token if
+    /// `want_logits` is true, otherwise `None`.
     ///
-    /// A step is just `{tokens, start_pos}`. Decode is `tokens.len() == 1`. Prefill is
-    /// `tokens.len() > 1`. When logits are requested the last token always runs through
-    /// the sequential path so its hidden state lands in the persistent activation buffers.
+    /// A step is just `{tokens}` against a session. Decode is `tokens.len() == 1`. Prefill is
+    /// `tokens.len() > 1`. When logits are requested the last token always runs through the
+    /// sequential path so its hidden state lands in the persistent activation buffers.
     pub fn forward(
-        &mut self,
+        &self,
         backend: &dyn Backend,
+        session: &mut Session,
         tokens: &[u32],
-        start_pos: usize,
         want_logits: bool,
     ) -> Option<Vec<f32>> {
         if tokens.is_empty() {
             return None;
         }
+
+        let start_pos = session.pos;
 
         // Batched GEMM is only a win for unquantized weights with multiple tokens.
         let unquantized = matches!(
@@ -156,7 +176,7 @@ impl LlamaModel {
         );
 
         // If logits are requested, peel the last token off so the sequential path
-        // leaves its hidden state in self.act.x for the output projection.
+        // leaves its hidden state in session.act.x for the output projection.
         let (batch, tail) = if want_logits {
             (&tokens[..tokens.len() - 1], Some(tokens[tokens.len() - 1]))
         } else {
@@ -165,99 +185,109 @@ impl LlamaModel {
 
         if !batch.is_empty() {
             if unquantized && batch.len() > 1 {
-                self.forward_batch_gemm(backend, batch, start_pos);
+                self.forward_batch_gemm(backend, session, batch, start_pos);
             } else {
                 for (i, &t) in batch.iter().enumerate() {
-                    self.forward_one(backend, t, start_pos + i);
+                    self.forward_one(backend, session, t, start_pos + i);
                 }
             }
         }
 
+        session.pos = start_pos + tokens.len();
+
         let tail_token = tail?;
         let tail_pos = start_pos + batch.len();
-        self.forward_one(backend, tail_token, tail_pos);
+        self.forward_one(backend, session, tail_token, tail_pos);
 
         backend.rms_norm(
-            &mut self.act.x_norm,
-            &self.act.x,
+            &mut session.act.x_norm,
+            &session.act.x,
             &self.weights.output_norm,
             self.config.norm_eps,
         );
         backend.matvec_mul(
-            &mut self.act.logits,
+            &mut session.act.logits,
             &self.weights.output_weight,
-            &self.act.x_norm,
+            &session.act.x_norm,
         );
-        Some(backend.read_to_vec_f32(&self.act.logits))
+        Some(backend.read_to_vec_f32(&session.act.logits))
     }
 
     /// Run one token through all transformer layers, populating the KV cache.
-    /// Leaves the post-FFN hidden state in `self.act.x`.
-    fn forward_one(&mut self, backend: &dyn Backend, token: u32, pos: usize) {
+    /// Leaves the post-FFN hidden state in `session.act.x`.
+    fn forward_one(&self, backend: &dyn Backend, session: &mut Session, token: u32, pos: usize) {
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
+        // Split-borrow disjoint fields so we can pass &act.X and &mut kv_cache together.
+        let act = &mut session.act;
+        let kv_cache = &mut session.kv_cache;
 
-        backend.embed(&mut self.act.x, &self.weights.token_embedding, token);
+        backend.embed(&mut act.x, &self.weights.token_embedding, token);
 
         for layer_idx in 0..self.config.n_layers {
             let layer = &self.weights.layers[layer_idx];
 
             // Attention
             backend.rms_norm(
-                &mut self.act.x_norm,
-                &self.act.x,
+                &mut act.x_norm,
+                &act.x,
                 &layer.attn_norm,
                 self.config.norm_eps,
             );
-            backend.matvec_mul(&mut self.act.q, &layer.wq, &self.act.x_norm);
-            backend.matvec_mul(&mut self.act.k, &layer.wk, &self.act.x_norm);
-            backend.matvec_mul(&mut self.act.v, &layer.wv, &self.act.x_norm);
+            backend.matvec_mul(&mut act.q, &layer.wq, &act.x_norm);
+            backend.matvec_mul(&mut act.k, &layer.wk, &act.x_norm);
+            backend.matvec_mul(&mut act.v, &layer.wv, &act.x_norm);
             backend.rope(
-                &mut self.act.q,
-                &mut self.act.k,
+                &mut act.q,
+                &mut act.k,
                 pos,
                 head_dim,
                 self.config.rope_theta,
             );
 
-            self.kv_cache
-                .store(backend, layer_idx, pos, &self.act.k, &self.act.v);
+            kv_cache.store(backend, layer_idx, pos, &act.k, &act.v);
 
             backend.gqa_attention(
-                &mut self.act.attn_out,
-                &self.act.q,
-                &self.kv_cache.k_cache[layer_idx],
-                &self.kv_cache.v_cache[layer_idx],
+                &mut act.attn_out,
+                &act.q,
+                &kv_cache.k_cache[layer_idx],
+                &kv_cache.v_cache[layer_idx],
                 pos,
                 n_heads,
                 self.config.n_kv_heads,
                 head_dim,
             );
 
-            backend.matvec_mul(&mut self.act.wo_out, &layer.wo, &self.act.attn_out);
-            backend.add(&mut self.act.x2, &self.act.x, &self.act.wo_out);
+            backend.matvec_mul(&mut act.wo_out, &layer.wo, &act.attn_out);
+            backend.add(&mut act.x2, &act.x, &act.wo_out);
 
             // FFN
             backend.rms_norm(
-                &mut self.act.x_norm,
-                &self.act.x2,
+                &mut act.x_norm,
+                &act.x2,
                 &layer.ffn_norm,
                 self.config.norm_eps,
             );
-            backend.matvec_mul(&mut self.act.gate, &layer.w1, &self.act.x_norm);
-            backend.matvec_mul(&mut self.act.up, &layer.w3, &self.act.x_norm);
-            backend.silu(&mut self.act.gate);
-            backend.mul(&mut self.act.gate_up, &self.act.gate, &self.act.up);
-            backend.matvec_mul(&mut self.act.ffn_out, &layer.w2, &self.act.gate_up);
+            backend.matvec_mul(&mut act.gate, &layer.w1, &act.x_norm);
+            backend.matvec_mul(&mut act.up, &layer.w3, &act.x_norm);
+            backend.silu(&mut act.gate);
+            backend.mul(&mut act.gate_up, &act.gate, &act.up);
+            backend.matvec_mul(&mut act.ffn_out, &layer.w2, &act.gate_up);
 
-            backend.add(&mut self.act.x, &self.act.x2, &self.act.ffn_out);
+            backend.add(&mut act.x, &act.x2, &act.ffn_out);
         }
     }
 
     /// Run a batch of tokens through all layers via batched GEMM, storing KV cache.
     /// Caller is responsible for choosing this path only when it's actually faster
     /// (unquantized weights, seq_len > 1).
-    fn forward_batch_gemm(&mut self, backend: &dyn Backend, tokens: &[u32], start_pos: usize) {
+    fn forward_batch_gemm(
+        &self,
+        backend: &dyn Backend,
+        session: &mut Session,
+        tokens: &[u32],
+        start_pos: usize,
+    ) {
         let seq_len = tokens.len();
         let dim = self.config.dim as u64;
         let kv_dim = (self.config.n_kv_heads * self.config.head_dim) as u64;
@@ -302,14 +332,14 @@ impl LlamaModel {
             );
 
             let kv_offset = start_pos * kv_dim as usize;
-            backend.copy_into(&mut self.kv_cache.k_cache[layer_idx], &k, kv_offset);
-            backend.copy_into(&mut self.kv_cache.v_cache[layer_idx], &v, kv_offset);
+            backend.copy_into(&mut session.kv_cache.k_cache[layer_idx], &k, kv_offset);
+            backend.copy_into(&mut session.kv_cache.v_cache[layer_idx], &v, kv_offset);
 
             backend.gqa_attention_batch(
                 &mut attn_out,
                 &q,
-                &self.kv_cache.k_cache[layer_idx],
-                &self.kv_cache.v_cache[layer_idx],
+                &session.kv_cache.k_cache[layer_idx],
+                &session.kv_cache.v_cache[layer_idx],
                 start_pos,
                 seq_len,
                 self.config.n_heads,
@@ -336,5 +366,4 @@ impl LlamaModel {
             backend.add(&mut x, &x2, &ffn_out);
         }
     }
-
 }

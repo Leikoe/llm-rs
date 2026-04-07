@@ -10,7 +10,7 @@ use llm_rs::backend::cpu::CpuBackend;
 use llm_rs::backend::metal::MetalBackend;
 use llm_rs::cli::{Cli, Command};
 use llm_rs::gguf::GgufFile;
-use llm_rs::model::llama::LlamaModel;
+use llm_rs::model::llama::{LlamaModel, Session};
 use llm_rs::sampler::{Sampler, SamplerConfig};
 
 use llm_rs::tokenizer::Tokenizer;
@@ -26,7 +26,7 @@ fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     let backend = CpuBackend::new();
 
-    let mut model = LlamaModel::from_gguf(&gguf, &backend);
+    let model = LlamaModel::from_gguf(&gguf, &backend);
 
     match cli.command {
         Command::Complete {
@@ -34,9 +34,11 @@ fn main() {
             max_tokens,
             sampling,
         } => {
+            let mut session = Session::new(&backend, &model.config);
             run_completion(
                 &backend,
-                &mut model,
+                &model,
+                &mut session,
                 &tokenizer,
                 &prompt,
                 max_tokens,
@@ -44,9 +46,11 @@ fn main() {
             );
         }
         Command::Chat { system, sampling } => {
+            let mut session = Session::new(&backend, &model.config);
             run_chat(
                 &backend,
-                &mut model,
+                &model,
+                &mut session,
                 &tokenizer,
                 system.as_deref(),
                 sampling.to_config(),
@@ -57,7 +61,8 @@ fn main() {
 
 fn run_completion(
     backend: &dyn Backend,
-    model: &mut LlamaModel,
+    model: &LlamaModel,
+    session: &mut Session,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -71,8 +76,7 @@ fn run_completion(
 
     // Prefill all prompt tokens in one call; logits come back for the last token.
     let start = Instant::now();
-    let mut logits = model.forward(backend, &tokens, 0, true).unwrap();
-    let mut pos = tokens.len();
+    let mut logits = model.forward(backend, session, &tokens, true).unwrap();
 
     let prefill_time = start.elapsed();
     eprintln!(
@@ -101,8 +105,7 @@ fn run_completion(
         io::stdout().flush().unwrap();
 
         generated += 1;
-        logits = model.forward(backend, &[next_token], pos, true).unwrap();
-        pos += 1;
+        logits = model.forward(backend, session, &[next_token], true).unwrap();
     }
 
     println!();
@@ -117,14 +120,14 @@ fn run_completion(
 
 fn run_chat(
     backend: &dyn Backend,
-    model: &mut LlamaModel,
+    model: &LlamaModel,
+    session: &mut Session,
     tokenizer: &Tokenizer,
     system_prompt: Option<&str>,
     sampler_config: SamplerConfig,
 ) {
     let mut sampler = Sampler::new(sampler_config);
     let stdin = io::stdin();
-    let mut pos = 0;
 
     // BOS + optional system prompt, prefilled in one call.
     let mut warmup = vec![tokenizer.bos_id];
@@ -132,8 +135,7 @@ fn run_chat(
         let sys_text = format!("<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>");
         warmup.extend(tokenizer.encode(&sys_text));
     }
-    model.forward(backend, &warmup, pos, false);
-    pos += warmup.len();
+    model.forward(backend, session, &warmup, false);
 
     eprintln!("Chat mode. Type your message and press Enter. Ctrl+D to exit.\n");
 
@@ -157,8 +159,7 @@ fn run_chat(
         let user_tokens = tokenizer.encode(&user_text);
 
         // Prefill user message in one call; logits come back for the last token.
-        let mut logits = model.forward(backend, &user_tokens, pos, true).unwrap();
-        pos += user_tokens.len();
+        let mut logits = model.forward(backend, session, &user_tokens, true).unwrap();
 
         // Generate response
         loop {
@@ -172,8 +173,7 @@ fn run_chat(
             io::stdout().write_all(&piece).unwrap();
             io::stdout().flush().unwrap();
 
-            logits = model.forward(backend, &[next_token], pos, true).unwrap();
-            pos += 1;
+            logits = model.forward(backend, session, &[next_token], true).unwrap();
         }
 
         println!();

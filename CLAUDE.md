@@ -10,6 +10,29 @@ High-performance LLM inference engine in Rust targeting Apple Metal (primary) an
 - Fewer lines > more lines. Fewer abstractions > more abstractions. Fewer dependencies > more dependencies.
 - If you need a comment to explain what the code does, the code is too clever.
 
+## Simplicity budget
+
+We are explicitly NOT trying to become vLLM, llama.cpp, or any other engine
+that grew into a maintenance nightmare. The goal is a fast, focused LLM
+inference engine that one person can hold in their head. Track size and push
+back on growth that doesn't pay for itself.
+
+| Metric                       | Current | Soft cap |
+|------------------------------|---------|----------|
+| Rust LOC (`src/**/*.rs`)     |   3361  |   6000   |
+| Metal LOC (`shaders/*.metal`)|   1456  |   3000   |
+| Non-Apple deps (Cargo.toml)  |     3   |     5    |
+
+When you cross a soft cap, stop and ask whether the new code is paying for
+its weight. Deletion is a feature. If a roadmap item ships with a net
+line-count increase, the PR description should justify why.
+
+Update the table when committing changes that materially shift the counts:
+```bash
+find src -name '*.rs' | xargs wc -l | tail -1
+find shaders -name '*.metal' | xargs wc -l | tail -1
+```
+
 ## Current Scope (v0.1)
 - **Models:** LLaMA family (LLaMA 3.x, Mistral) -- dense only
 - **Weights:** GGUF format, direct file read
