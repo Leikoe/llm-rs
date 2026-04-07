@@ -586,6 +586,31 @@ impl Backend for MetalBackend {
         self.perf_log("rms_norm", act_bytes * 2 + weight.dtype.storage_size(d), 5 * d * seq_len);
     }
 
+    fn rms_norm_heads(&self, x: &mut MetalBuffer, weight: &MetalBuffer, eps: f32) {
+        // Same shader as rms_norm; in-place, one group per head_dim chunk.
+        let dim = weight.n_elements() as u32;
+        let n_groups = x.n_elements() / dim as usize;
+        let tg = 1024usize.min(dim as usize);
+        let shared = (((tg) + 31) / 32) * 4;
+        self.encode_groups(
+            "rms_norm_batch",
+            sz(n_groups, 1, 1),
+            sz(tg, 1, 1),
+            shared,
+            |enc| unsafe {
+                set_buf(enc, x, 0);
+                set_buf(enc, weight, 1);
+                set_buf(enc, x, 2);
+                set_u32(enc, dim, 3);
+                set_f32(enc, eps, 4);
+            },
+        );
+
+        let d = dim as usize;
+        let act_bytes = x.dtype.storage_size(d * n_groups);
+        self.perf_log("rms_norm_heads", act_bytes * 2 + weight.dtype.storage_size(d), 5 * d * n_groups);
+    }
+
     fn rope(
         &self,
         q: &mut MetalBuffer,

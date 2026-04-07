@@ -30,9 +30,13 @@ impl ModelConfig {
 
         let arch = &architecture;
 
-        let vocab_size = get_u32(metadata, &format!("{arch}.vocab_size"))
-            .or_else(|| get_u32(metadata, "tokenizer.ggml.tokens_count"))
-            .unwrap_or(32000) as usize;
+        // GGUF doesn't store vocab_size directly; derive it from the token table length.
+        // GGUF doesn't store vocab_size directly; derive it from the token table length.
+        let vocab_size = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_string_array())
+            .expect("missing tokenizer.ggml.tokens")
+            .len();
 
         let dim = get_u32(metadata, &format!("{arch}.embedding_length"))
             .expect("missing embedding_length") as usize;
@@ -46,7 +50,10 @@ impl ModelConfig {
         let n_kv_heads = get_u32(metadata, &format!("{arch}.attention.head_count_kv"))
             .unwrap_or(n_heads as u32) as usize;
 
-        let head_dim = dim / n_heads;
+        // Qwen3 stores head_dim explicitly (key_length); LLaMA derives it from dim/n_heads.
+        let head_dim = get_u32(metadata, &format!("{arch}.attention.key_length"))
+            .map(|v| v as usize)
+            .unwrap_or(dim / n_heads);
 
         let hidden_dim = get_u32(metadata, &format!("{arch}.feed_forward_length"))
             .expect("missing feed_forward_length") as usize;

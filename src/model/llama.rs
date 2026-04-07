@@ -14,6 +14,10 @@ pub struct LlamaLayerWeights<B: Backend> {
     pub w1: B::Buffer, // gate
     pub w2: B::Buffer, // down
     pub w3: B::Buffer, // up
+    /// Qwen3 only: per-head RMSNorm on Q and K applied before RoPE.
+    /// Each is shape `[head_dim]`, broadcast across all heads.
+    pub attn_q_norm: Option<B::Buffer>,
+    pub attn_k_norm: Option<B::Buffer>,
 }
 
 pub struct LlamaWeights<B: Backend> {
@@ -73,21 +77,19 @@ impl<B: Backend> LlamaModel<B> {
         );
 
         let upload_start = std::time::Instant::now();
-        let mut bytes_uploaded: usize = 0;
-        let mut load = |name: &str| -> B::Buffer {
-            let tv = gguf
-                .tensor_view(name)
-                .unwrap_or_else(|_| panic!("missing tensor: {name}"));
-            bytes_uploaded += tv.data.len();
-            backend.upload_tensor(&tv)
+        let bytes_uploaded = std::cell::Cell::new(0usize);
+        let load_opt = |name: &str| -> Option<B::Buffer> {
+            gguf.tensor_view(name).ok().map(|tv| {
+                bytes_uploaded.set(bytes_uploaded.get() + tv.data.len());
+                backend.upload_tensor(&tv)
+            })
+        };
+        let load = |name: &str| -> B::Buffer {
+            load_opt(name).unwrap_or_else(|| panic!("missing tensor: {name}"))
         };
 
         let token_embedding = load("token_embd.weight");
-        let output_weight = if gguf.tensor_view("output.weight").is_ok() {
-            load("output.weight")
-        } else {
-            load("token_embd.weight")
-        };
+        let output_weight = load_opt("output.weight").unwrap_or_else(|| load("token_embd.weight"));
         let output_norm = load("output_norm.weight");
 
         let mut layers = Vec::with_capacity(config.n_layers);
@@ -102,11 +104,13 @@ impl<B: Backend> LlamaModel<B> {
                 w1: load(&format!("blk.{i}.ffn_gate.weight")),
                 w2: load(&format!("blk.{i}.ffn_down.weight")),
                 w3: load(&format!("blk.{i}.ffn_up.weight")),
+                attn_q_norm: load_opt(&format!("blk.{i}.attn_q_norm.weight")),
+                attn_k_norm: load_opt(&format!("blk.{i}.attn_k_norm.weight")),
             });
         }
 
         let elapsed = upload_start.elapsed().as_secs_f64();
-        let gb = bytes_uploaded as f64 / (1024.0 * 1024.0 * 1024.0);
+        let gb = bytes_uploaded.get() as f64 / (1024.0 * 1024.0 * 1024.0);
         eprintln!("Uploaded model weights to backend: {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
         LlamaModel {
@@ -193,6 +197,11 @@ impl<B: Backend> LlamaModel<B> {
             backend.matmul(&mut s.q, &layer.wq, &s.x_norm);
             backend.matmul(&mut s.k, &layer.wk, &s.x_norm);
             backend.matmul(&mut s.v, &layer.wv, &s.x_norm);
+            // Qwen3 QK-norm: per-head RMSNorm on Q and K before RoPE.
+            if let (Some(qn), Some(kn)) = (&layer.attn_q_norm, &layer.attn_k_norm) {
+                backend.rms_norm_heads(&mut s.q, qn, self.config.norm_eps);
+                backend.rms_norm_heads(&mut s.k, kn, self.config.norm_eps);
+            }
             backend.rope(&mut s.q, &mut s.k, start_pos, self.config.head_dim, self.config.rope_theta);
 
             backend.copy_into(&mut kv_cache.k_cache[layer_idx], &s.k, start_pos * kv_dim);
@@ -245,19 +254,21 @@ struct Scratch<B: Backend> {
 impl<B: Backend> Scratch<B> {
     fn new(backend: &B, config: &ModelConfig, seq_len: usize) -> Self {
         let dim = config.dim as u64;
+        let q_dim = (config.n_heads * config.head_dim) as u64;
         let kv_dim = (config.n_kv_heads * config.head_dim) as u64;
         let hidden = config.hidden_dim as u64;
         let n = seq_len as u64;
         let shape: &[u64] = if seq_len == 1 { &[dim] } else { &[dim, n] };
+        let q_shape: &[u64] = if seq_len == 1 { &[q_dim] } else { &[q_dim, n] };
         let kv_shape: &[u64] = if seq_len == 1 { &[kv_dim] } else { &[kv_dim, n] };
         let h_shape: &[u64] = if seq_len == 1 { &[hidden] } else { &[hidden, n] };
         Scratch {
             x: backend.alloc(shape, DType::BF16),
             x_norm: backend.alloc(shape, DType::BF16),
-            q: backend.alloc(shape, DType::BF16),
+            q: backend.alloc(q_shape, DType::BF16),
             k: backend.alloc(kv_shape, DType::BF16),
             v: backend.alloc(kv_shape, DType::BF16),
-            attn_out: backend.alloc(shape, DType::BF16),
+            attn_out: backend.alloc(q_shape, DType::BF16),
             wo_out: backend.alloc(shape, DType::BF16),
             x2: backend.alloc(shape, DType::BF16),
             gate: backend.alloc(h_shape, DType::BF16),

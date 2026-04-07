@@ -37,6 +37,11 @@ pub trait Backend {
     /// column of `input` independently when `input` is 2D.
     fn rms_norm(&self, out: &mut Self::Buffer, input: &Self::Buffer, weight: &Self::Buffer, eps: f32);
 
+    /// In-place per-head RMSNorm: independently normalize every contiguous
+    /// `weight.len()`-sized chunk of `x`. Used by Qwen3's QK-norm. `weight` is broadcast
+    /// across all heads.
+    fn rms_norm_heads(&self, x: &mut Self::Buffer, weight: &Self::Buffer, eps: f32);
+
     /// Apply rotary embeddings to `q` and `k` in place. `start_pos` is the
     /// absolute position of column 0; column `s` gets position `start_pos + s`.
     fn rope(&self, q: &mut Self::Buffer, k: &mut Self::Buffer, start_pos: usize, head_dim: usize, rope_theta: f32);
