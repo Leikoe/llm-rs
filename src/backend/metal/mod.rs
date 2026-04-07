@@ -7,15 +7,29 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 
-use crate::backend::{Backend, DeviceBuffer};
+use crate::backend::Backend;
 use crate::tensor::{DType, TensorView};
 
-struct MetalBuffer {
+pub struct MetalBuffer {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Byte offset of the logical data within `buf`. Non-zero only for zero-copy
     /// weight uploads where the underlying GGUF tensor isn't page-aligned and we
     /// wrapped a page-rounded-down region.
     offset: usize,
+    pub dtype: DType,
+    pub shape: Vec<u64>,
+}
+
+impl MetalBuffer {
+    pub fn n_elements(&self) -> usize {
+        self.shape.iter().map(|&d| d as usize).product()
+    }
+
+    /// Number of columns. 1D shapes (decode) → 1, 2D shapes (prefill) → shape[1].
+    /// This is the only thing the backend needs to tell decode and prefill apart.
+    pub fn seq_len(&self) -> usize {
+        if self.shape.len() > 1 { self.shape[1] as usize } else { 1 }
+    }
 }
 
 const PAGE_SIZE: usize = 16384;
@@ -313,12 +327,6 @@ impl MetalBackend {
     }
 }
 
-/// Number of columns in a buffer. 1D shapes (decode) → 1, 2D shapes (prefill) → shape[1].
-/// This is the only thing the backend needs to tell decode and prefill apart.
-fn seq_len_of(buf: &DeviceBuffer) -> usize {
-    if buf.shape.len() > 1 { buf.shape[1] as usize } else { 1 }
-}
-
 fn sz(w: usize, h: usize, d: usize) -> MTLSize {
     MTLSize {
         width: w,
@@ -329,11 +337,10 @@ fn sz(w: usize, h: usize, d: usize) -> MTLSize {
 
 unsafe fn set_buf(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    buf: &DeviceBuffer,
+    buf: &MetalBuffer,
     idx: usize,
 ) {
-    let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
-    unsafe { enc.setBuffer_offset_atIndex(Some(&m.buf), m.offset, idx) };
+    unsafe { enc.setBuffer_offset_atIndex(Some(&buf.buf), buf.offset, idx) };
 }
 
 unsafe fn set_u32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: u32, idx: usize) {
@@ -357,10 +364,12 @@ unsafe fn set_f32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: f32, 
 }
 
 impl Backend for MetalBackend {
+    type Buffer = MetalBuffer;
+
     fn gpu_secs_total(&self) -> f64 { *self.gpu_secs_total.borrow() }
     fn reset_gpu_secs(&self) { *self.gpu_secs_total.borrow_mut() = 0.0; }
 
-    fn upload_tensor(&self, tv: &TensorView) -> DeviceBuffer {
+    fn upload_tensor(&self, tv: &TensorView) -> MetalBuffer {
         // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
         // means the GPU sees the same memory the CPU loaded the file into.
         // Metal requires the pointer to be page-aligned and the length to be a page
@@ -381,31 +390,23 @@ impl Backend for MetalBackend {
             )
         }
         .expect("Failed to create no-copy buffer");
-        DeviceBuffer {
-            inner: Box::new(MetalBuffer { buf, offset }),
-            dtype: tv.dtype,
-            shape: tv.shape.clone(),
-        }
+        MetalBuffer { buf, offset, dtype: tv.dtype, shape: tv.shape.clone() }
     }
 
-    fn alloc(&self, shape: &[u64], dtype: DType) -> DeviceBuffer {
+    fn alloc(&self, shape: &[u64], dtype: DType) -> MetalBuffer {
         let n: usize = shape.iter().map(|&d| d as usize).product();
         let size = dtype.storage_size(n);
         let buf = self
             .device
             .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
             .expect("Failed to alloc buffer");
-        DeviceBuffer {
-            inner: Box::new(MetalBuffer { buf, offset: 0 }),
-            dtype,
-            shape: shape.to_vec(),
-        }
+        MetalBuffer { buf, offset: 0, dtype, shape: shape.to_vec() }
     }
 
-    fn matmul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer) {
+    fn matmul(&self, out: &mut MetalBuffer, weight: &MetalBuffer, input: &MetalBuffer) {
         let in_f = weight.shape[0] as u32;
         let out_f = weight.shape[1] as u32;
-        let seq_len = seq_len_of(input) as u32;
+        let seq_len = input.seq_len() as u32;
 
         // Decode (single column): always dispatch the optimized SIMD matvec.
         if seq_len == 1 {
@@ -523,10 +524,6 @@ impl Backend for MetalBackend {
             let groups = sz(n_tg, 1, 1);
             let tg = sz(nsg * 32, 1, 1);
 
-            let in_m = input.inner.downcast_ref::<MetalBuffer>().unwrap();
-            let out_m = out.inner.downcast_ref::<MetalBuffer>().unwrap();
-            let w_m = weight.inner.downcast_ref::<MetalBuffer>().unwrap();
-
             let mut state = self.cmd.borrow_mut();
             let s = state.get_or_insert_with(|| {
                 let cb = self.queue.commandBuffer().unwrap();
@@ -537,13 +534,13 @@ impl Backend for MetalBackend {
 
             unsafe {
                 s.encoder.setComputePipelineState(pso);
-                s.encoder.setBuffer_offset_atIndex(Some(&w_m.buf), w_m.offset, 0);
+                s.encoder.setBuffer_offset_atIndex(Some(&weight.buf), weight.offset, 0);
                 set_u32(&s.encoder, in_f, 3);
                 set_u32(&s.encoder, out_f, 4);
 
                 for pos in 0..seq_len as usize {
-                    s.encoder.setBuffer_offset_atIndex(Some(&in_m.buf), in_m.offset + pos * in_stride, 1);
-                    s.encoder.setBuffer_offset_atIndex(Some(&out_m.buf), out_m.offset + pos * out_stride, 2);
+                    s.encoder.setBuffer_offset_atIndex(Some(&input.buf), input.offset + pos * in_stride, 1);
+                    s.encoder.setBuffer_offset_atIndex(Some(&out.buf), out.offset + pos * out_stride, 2);
                     s.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
                 }
                 s.encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -561,13 +558,13 @@ impl Backend for MetalBackend {
 
     fn rms_norm(
         &self,
-        out: &mut DeviceBuffer,
-        input: &DeviceBuffer,
-        weight: &DeviceBuffer,
+        out: &mut MetalBuffer,
+        input: &MetalBuffer,
+        weight: &MetalBuffer,
         eps: f32,
     ) {
         let dim = weight.n_elements() as u32;
-        let seq_len = seq_len_of(input);
+        let seq_len = MetalBuffer::seq_len(input);
         let tg = 1024usize.min(dim as usize);
         let shared = (((tg) + 31) / 32) * 4;
         self.encode_groups(
@@ -591,15 +588,15 @@ impl Backend for MetalBackend {
 
     fn rope(
         &self,
-        q: &mut DeviceBuffer,
-        k: &mut DeviceBuffer,
+        q: &mut MetalBuffer,
+        k: &mut MetalBuffer,
         start_pos: usize,
         head_dim: usize,
         rope_theta: f32,
     ) {
-        let seq_len = seq_len_of(q);
+        let seq_len = MetalBuffer::seq_len(q);
 
-        let dispatch = |buf: &mut DeviceBuffer| {
+        let dispatch = |buf: &mut MetalBuffer| {
             let total = buf.n_elements();
             let row_stride = total / seq_len;
             let pairs_per_row = row_stride / 2;
@@ -626,7 +623,7 @@ impl Backend for MetalBackend {
         self.perf_log("rope", total_n * elem_size * 2, total_n / 2 * 10);
     }
 
-    fn silu(&self, x: &mut DeviceBuffer) {
+    fn silu(&self, x: &mut MetalBuffer) {
         let n = x.n_elements() as u32;
         self.encode("silu_inplace", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
             set_buf(enc, x, 0);
@@ -636,7 +633,7 @@ impl Backend for MetalBackend {
         self.perf_log("silu", x.dtype.storage_size(n as usize) * 2, 4 * n as usize);
     }
 
-    fn mul(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer) {
+    fn mul(&self, out: &mut MetalBuffer, a: &MetalBuffer, b: &MetalBuffer) {
         let n = a.n_elements() as u32;
         self.encode("mul_vecs", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
             set_buf(enc, a, 0);
@@ -648,7 +645,7 @@ impl Backend for MetalBackend {
         self.perf_log("mul", a.dtype.storage_size(n as usize) * 3, n as usize);
     }
 
-    fn add(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer) {
+    fn add(&self, out: &mut MetalBuffer, a: &MetalBuffer, b: &MetalBuffer) {
         let n = a.n_elements() as u32;
         self.encode("add_vecs", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
             set_buf(enc, a, 0);
@@ -660,7 +657,7 @@ impl Backend for MetalBackend {
         self.perf_log("add", a.dtype.storage_size(n as usize) * 3, n as usize);
     }
 
-    fn argmax(&self, logits: &DeviceBuffer) -> u32 {
+    fn argmax(&self, logits: &MetalBuffer) -> u32 {
         assert!(matches!(logits.dtype, DType::BF16), "argmax expects BF16 logits");
         let n = logits.n_elements() as u32;
         let out = self.alloc(&[1], DType::I32);
@@ -676,12 +673,11 @@ impl Backend for MetalBackend {
             },
         );
         self.flush();
-        let m = out.inner.downcast_ref::<MetalBuffer>().unwrap();
-        let ptr = unsafe { (m.buf.contents().as_ptr() as *const u8).add(m.offset) as *const u32 };
+        let ptr = unsafe { (out.buf.contents().as_ptr() as *const u8).add(out.offset) as *const u32 };
         unsafe { *ptr }
     }
 
-    fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, tokens: &[u32]) {
+    fn embed(&self, out: &mut MetalBuffer, table: &MetalBuffer, tokens: &[u32]) {
         let seq_len = tokens.len();
         let token_buf = unsafe {
             self.device.newBufferWithBytes_length_options(
@@ -722,16 +718,16 @@ impl Backend for MetalBackend {
 
     fn attention(
         &self,
-        out: &mut DeviceBuffer,
-        q: &DeviceBuffer,
-        k_cache: &DeviceBuffer,
-        v_cache: &DeviceBuffer,
+        out: &mut MetalBuffer,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
         start_pos: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
     ) {
-        let seq_len = seq_len_of(q);
+        let seq_len = MetalBuffer::seq_len(q);
         let kv_dim = (n_kv_heads * head_dim) as u32;
         let fa_block = 32;
         let n_simdgroups = (head_dim + 31) / 32;
@@ -790,7 +786,7 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn copy_into(&self, dst: &mut DeviceBuffer, src: &DeviceBuffer, dst_offset_elements: usize) {
+    fn copy_into(&self, dst: &mut MetalBuffer, src: &MetalBuffer, dst_offset_elements: usize) {
         let count = src.n_elements() as u32;
         let offset = dst_offset_elements as u32;
         self.encode(
@@ -809,7 +805,7 @@ impl Backend for MetalBackend {
         self.perf_log("copy_offset", src.dtype.storage_size(count as usize) * 2, 0);
     }
 
-    fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32> {
+    fn read_to_vec_f32(&self, buf: &MetalBuffer) -> Vec<f32> {
         if self.perf {
             // In perf mode, all kernels already flushed individually.
             // Dump the accumulated stats.
@@ -817,9 +813,8 @@ impl Backend for MetalBackend {
         } else {
             self.flush();
         }
-        let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
         let n = buf.n_elements();
-        let base = unsafe { (m.buf.contents().as_ptr() as *const u8).add(m.offset) };
+        let base = unsafe { (buf.buf.contents().as_ptr() as *const u8).add(buf.offset) };
         match buf.dtype {
             DType::BF16 => {
                 let ptr = base as *const u16;

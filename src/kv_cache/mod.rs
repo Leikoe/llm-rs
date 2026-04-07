@@ -1,19 +1,19 @@
-use crate::backend::{Backend, DeviceBuffer};
+use crate::backend::Backend;
 use crate::model::ModelConfig;
 use crate::tensor::DType;
 
 /// Per-layer key/value cache for autoregressive generation.
-pub struct KVCache {
+pub struct KVCache<B: Backend> {
     /// Per-layer key cache: flat [max_seq_len * kv_dim] as bf16.
-    pub k_cache: Vec<DeviceBuffer>,
+    pub k_cache: Vec<B::Buffer>,
     /// Per-layer value cache: flat [max_seq_len * kv_dim] as bf16.
-    pub v_cache: Vec<DeviceBuffer>,
+    pub v_cache: Vec<B::Buffer>,
     pub kv_dim: usize,
     pub max_seq_len: usize,
 }
 
-impl KVCache {
-    pub fn new(backend: &dyn Backend, config: &ModelConfig) -> Self {
+impl<B: Backend> KVCache<B> {
+    pub fn new(backend: &B, config: &ModelConfig) -> Self {
         let kv_dim = config.n_kv_heads * config.head_dim;
         let mut k_cache = Vec::with_capacity(config.n_layers);
         let mut v_cache = Vec::with_capacity(config.n_layers);
@@ -35,19 +35,5 @@ impl KVCache {
             kv_dim,
             max_seq_len: config.max_seq_len,
         }
-    }
-
-    /// Store k, v vectors for a given layer at the given position.
-    pub fn store(
-        &mut self,
-        backend: &dyn Backend,
-        layer: usize,
-        pos: usize,
-        k: &DeviceBuffer,
-        v: &DeviceBuffer,
-    ) {
-        let offset = pos * self.kv_dim;
-        backend.copy_into(&mut self.k_cache[layer], k, offset);
-        backend.copy_into(&mut self.v_cache[layer], v, offset);
     }
 }

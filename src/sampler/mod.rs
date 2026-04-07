@@ -44,7 +44,7 @@ impl Default for SamplerConfig {
     }
 }
 
-use crate::backend::{Backend, DeviceBuffer};
+use crate::backend::Backend;
 
 pub struct Sampler {
     config: SamplerConfig,
@@ -60,7 +60,7 @@ impl Sampler {
     /// Sample the next token id from on-device logits. Greedy (temp=0) stays
     /// fully on device — only 4 bytes come back. Stochastic paths still need
     /// the full vector CPU-side.
-    pub fn sample(&mut self, backend: &dyn Backend, logits: &DeviceBuffer) -> u32 {
+    pub fn sample<B: Backend>(&mut self, backend: &B, logits: &B::Buffer) -> u32 {
         if self.config.temperature == 0.0 {
             return backend.argmax(logits);
         }

@@ -12,15 +12,20 @@ use llm_rs::sampler::{Sampler, SamplerConfig};
 
 use llm_rs::tokenizer::Tokenizer;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let gguf = GgufFile::open(&cli.model).expect("failed to open GGUF file");
+    let gguf = GgufFile::open(&cli.model)?;
     let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
 
+    // One match-and-dispatch at startup. Future backends slot in here.
     let backend = MetalBackend::new();
+    run(&backend, &gguf, &tokenizer, cli);
+    Ok(())
+}
 
-    let model = LlamaModel::from_gguf(&gguf, &backend);
+fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli) {
+    let model = LlamaModel::from_gguf(gguf, backend);
 
     match cli.command {
         Command::Complete {
@@ -28,24 +33,24 @@ fn main() {
             max_tokens,
             sampling,
         } => {
-            let mut session = Session::new(&backend, &model.config);
+            let mut session = Session::new(backend, &model.config);
             run_completion(
-                &backend,
+                backend,
                 &model,
                 &mut session,
-                &tokenizer,
+                tokenizer,
                 &prompt,
                 max_tokens,
                 sampling.to_config(),
             );
         }
         Command::Chat { system, sampling } => {
-            let mut session = Session::new(&backend, &model.config);
+            let mut session = Session::new(backend, &model.config);
             run_chat(
-                &backend,
+                backend,
                 &model,
                 &mut session,
-                &tokenizer,
+                tokenizer,
                 system.as_deref(),
                 sampling.to_config(),
             );
@@ -53,10 +58,10 @@ fn main() {
     }
 }
 
-fn run_completion(
-    backend: &dyn Backend,
-    model: &LlamaModel,
-    session: &mut Session,
+fn run_completion<B: Backend>(
+    backend: &B,
+    model: &LlamaModel<B>,
+    session: &mut Session<B>,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -118,10 +123,10 @@ fn run_completion(
     );
 }
 
-fn run_chat(
-    backend: &dyn Backend,
-    model: &LlamaModel,
-    session: &mut Session,
+fn run_chat<B: Backend>(
+    backend: &B,
+    model: &LlamaModel<B>,
+    session: &mut Session<B>,
     tokenizer: &Tokenizer,
     system_prompt: Option<&str>,
     sampler_config: SamplerConfig,

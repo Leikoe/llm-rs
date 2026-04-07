@@ -1,32 +1,32 @@
-use crate::backend::{Backend, DeviceBuffer};
+use crate::backend::Backend;
 use crate::gguf::GgufFile;
 use crate::kv_cache::KVCache;
 use crate::model::ModelConfig;
 use crate::tensor::DType;
 
-pub struct LlamaLayerWeights {
-    pub attn_norm: DeviceBuffer,
-    pub wq: DeviceBuffer,
-    pub wk: DeviceBuffer,
-    pub wv: DeviceBuffer,
-    pub wo: DeviceBuffer,
-    pub ffn_norm: DeviceBuffer,
-    pub w1: DeviceBuffer, // gate
-    pub w2: DeviceBuffer, // down
-    pub w3: DeviceBuffer, // up
+pub struct LlamaLayerWeights<B: Backend> {
+    pub attn_norm: B::Buffer,
+    pub wq: B::Buffer,
+    pub wk: B::Buffer,
+    pub wv: B::Buffer,
+    pub wo: B::Buffer,
+    pub ffn_norm: B::Buffer,
+    pub w1: B::Buffer, // gate
+    pub w2: B::Buffer, // down
+    pub w3: B::Buffer, // up
 }
 
-pub struct LlamaWeights {
-    pub token_embedding: DeviceBuffer,
-    pub output_norm: DeviceBuffer,
-    pub output_weight: DeviceBuffer,
-    pub layers: Vec<LlamaLayerWeights>,
+pub struct LlamaWeights<B: Backend> {
+    pub token_embedding: B::Buffer,
+    pub output_norm: B::Buffer,
+    pub output_weight: B::Buffer,
+    pub layers: Vec<LlamaLayerWeights<B>>,
 }
 
 /// Immutable model: weights + config. Shareable across sessions.
-pub struct LlamaModel {
+pub struct LlamaModel<B: Backend> {
     pub config: ModelConfig,
-    pub weights: LlamaWeights,
+    pub weights: LlamaWeights<B>,
 }
 
 /// Per-request mutable state. One session = one conversation.
@@ -35,16 +35,16 @@ pub struct LlamaModel {
 /// token. Decode steps mutate them in place; prefill steps allocate a separate
 /// batch-sized scratch on the stack and discard it. This is vLLM V1's
 /// persistent-batch idea at our scale: never allocate on the per-token path.
-pub struct Session {
-    pub kv_cache: KVCache,
+pub struct Session<B: Backend> {
+    pub kv_cache: KVCache<B>,
     pub pos: usize,
     /// On-device logits for the most recent `forward(want_logits=true)` call.
-    logits: DeviceBuffer,
-    decode: Scratch,
+    logits: B::Buffer,
+    decode: Scratch<B>,
 }
 
-impl Session {
-    pub fn new(backend: &dyn Backend, config: &ModelConfig) -> Self {
+impl<B: Backend> Session<B> {
+    pub fn new(backend: &B, config: &ModelConfig) -> Self {
         Session {
             kv_cache: KVCache::new(backend, config),
             pos: 0,
@@ -53,13 +53,13 @@ impl Session {
         }
     }
 
-    pub fn logits(&self) -> &DeviceBuffer {
+    pub fn logits(&self) -> &B::Buffer {
         &self.logits
     }
 }
 
-impl LlamaModel {
-    pub fn from_gguf(gguf: &GgufFile, backend: &dyn Backend) -> Self {
+impl<B: Backend> LlamaModel<B> {
+    pub fn from_gguf(gguf: &GgufFile, backend: &B) -> Self {
         let config = ModelConfig::from_gguf_metadata(&gguf.metadata);
 
         eprintln!(
@@ -74,7 +74,7 @@ impl LlamaModel {
 
         let upload_start = std::time::Instant::now();
         let mut bytes_uploaded: usize = 0;
-        let mut load = |name: &str| -> DeviceBuffer {
+        let mut load = |name: &str| -> B::Buffer {
             let tv = gguf
                 .tensor_view(name)
                 .unwrap_or_else(|_| panic!("missing tensor: {name}"));
@@ -130,8 +130,8 @@ impl LlamaModel {
     /// output projection sees a 1D hidden state.
     pub fn forward(
         &self,
-        backend: &dyn Backend,
-        session: &mut Session,
+        backend: &B,
+        session: &mut Session<B>,
         tokens: &[u32],
         want_logits: bool,
     ) {
@@ -176,9 +176,9 @@ impl LlamaModel {
     /// `tokens.len() == 1` (decode) and `> 1` (prefill) take exactly the same call.
     fn run_layers(
         &self,
-        backend: &dyn Backend,
-        s: &mut Scratch,
-        kv_cache: &mut KVCache,
+        backend: &B,
+        s: &mut Scratch<B>,
+        kv_cache: &mut KVCache<B>,
         tokens: &[u32],
         start_pos: usize,
     ) {
@@ -227,23 +227,23 @@ impl LlamaModel {
 /// Activation buffers for one `run_layers` pass, sized to a fixed seq_len.
 /// The decode instance lives on `Session` for the lifetime of the conversation;
 /// prefill instances are short-lived (one per `forward` with a batch).
-struct Scratch {
-    x: DeviceBuffer,
-    x_norm: DeviceBuffer,
-    q: DeviceBuffer,
-    k: DeviceBuffer,
-    v: DeviceBuffer,
-    attn_out: DeviceBuffer,
-    wo_out: DeviceBuffer,
-    x2: DeviceBuffer,
-    gate: DeviceBuffer,
-    up: DeviceBuffer,
-    gate_up: DeviceBuffer,
-    ffn_out: DeviceBuffer,
+struct Scratch<B: Backend> {
+    x: B::Buffer,
+    x_norm: B::Buffer,
+    q: B::Buffer,
+    k: B::Buffer,
+    v: B::Buffer,
+    attn_out: B::Buffer,
+    wo_out: B::Buffer,
+    x2: B::Buffer,
+    gate: B::Buffer,
+    up: B::Buffer,
+    gate_up: B::Buffer,
+    ffn_out: B::Buffer,
 }
 
-impl Scratch {
-    fn new(backend: &dyn Backend, config: &ModelConfig, seq_len: usize) -> Self {
+impl<B: Backend> Scratch<B> {
+    fn new(backend: &B, config: &ModelConfig, seq_len: usize) -> Self {
         let dim = config.dim as u64;
         let kv_dim = (config.n_kv_heads * config.head_dim) as u64;
         let hidden = config.hidden_dim as u64;
