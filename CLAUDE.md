@@ -38,7 +38,7 @@ back on growth that doesn't pay for itself.
 
 | Metric                       | Current | Soft cap |
 |------------------------------|---------|----------|
-| Rust LOC (`src/**/*.rs`)     |   3421  |   6000   |
+| Rust LOC (`src/**/*.rs`)     |   2651  |   6000   |
 | Metal LOC (`shaders/*.metal`)|   1498  |   3000   |
 | Non-Apple deps (Cargo.toml)  |     3   |     5    |
 
@@ -94,20 +94,24 @@ No `serde`, `tokio`, `rand`, `ndarray`, or any ML framework.
 pub trait Backend {
     fn upload_tensor(&self, tv: &TensorView) -> DeviceBuffer;
     fn alloc(&self, shape: &[u64], dtype: DType) -> DeviceBuffer;
-    fn matvec_mul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer);
-    fn matmul(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
+    fn argmax(&self, logits: &DeviceBuffer) -> u32;
+    fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, tokens: &[u32]);
+    fn matmul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer);
     fn rms_norm(&self, out: &mut DeviceBuffer, input: &DeviceBuffer, weight: &DeviceBuffer, eps: f32);
-    fn rope(&self, q: &mut DeviceBuffer, k: &mut DeviceBuffer, pos: usize, head_dim: usize, theta: f32);
-    fn softmax(&self, x: &mut DeviceBuffer, len: usize);
+    fn rope(&self, q: &mut DeviceBuffer, k: &mut DeviceBuffer, start_pos: usize, head_dim: usize, theta: f32);
+    fn attention(&self, out: &mut DeviceBuffer, q: &DeviceBuffer, k_cache: &DeviceBuffer, v_cache: &DeviceBuffer,
+                 start_pos: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize);
     fn silu(&self, x: &mut DeviceBuffer);
     fn mul(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
     fn add(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
-    fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_id: u32);
     fn copy_into(&self, dst: &mut DeviceBuffer, src: &DeviceBuffer, dst_offset_elements: usize);
     fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32>;
 }
 ```
-Operations map 1:1 to transformer forward pass. `DeviceBuffer` uses `Box<dyn Any>` for type erasure.
+Every op is shape-agnostic w.r.t. seq_len: decode (`seq_len == 1`) and prefill (`seq_len > 1`)
+take exactly the same call. The backend reads `seq_len` from `input.shape[1]` (or 1 if 1D) and
+dispatches GEMV vs GEMM, single-query flash attention vs causal attention. The model layer
+doesn't know or care. `DeviceBuffer` uses `Box<dyn Any>` for type erasure.
 
 ### LLaMA Forward Pass (single token at position `pos`)
 ```

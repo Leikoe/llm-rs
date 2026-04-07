@@ -4,9 +4,6 @@ use std::time::Instant;
 use clap::Parser;
 
 use llm_rs::backend::Backend;
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
-use llm_rs::backend::cpu::CpuBackend;
-#[cfg(all(target_os = "macos", feature = "metal"))]
 use llm_rs::backend::metal::MetalBackend;
 use llm_rs::cli::{Cli, Command};
 use llm_rs::gguf::GgufFile;
@@ -21,10 +18,7 @@ fn main() {
     let gguf = GgufFile::open(&cli.model).expect("failed to open GGUF file");
     let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
     let backend = MetalBackend::new();
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    let backend = CpuBackend::new();
 
     let model = LlamaModel::from_gguf(&gguf, &backend);
 

@@ -43,17 +43,17 @@ fn bench_matmul(backend: &MetalBackend, cfg: &BenchConfig) -> (f64, f64, f64) {
 
 fn bench_matvec_seq(backend: &MetalBackend, cfg: &BenchConfig) -> (f64, f64, f64) {
     let weight = backend.alloc(&[cfg.m as u64, cfg.n as u64], cfg.dtype);
-    let mut input = backend.alloc(&[cfg.m as u64], DType::BF16);
+    let input = backend.alloc(&[cfg.m as u64], DType::BF16);
     let mut output = backend.alloc(&[cfg.n as u64], DType::BF16);
 
     for _ in 0..3 {
-        for _ in 0..cfg.seq_len { backend.matvec_mul(&mut output, &weight, &input); }
+        for _ in 0..cfg.seq_len { backend.matmul(&mut output, &weight, &input); }
     }
     backend.sync();
 
     let start = Instant::now();
     for _ in 0..cfg.iters {
-        for _ in 0..cfg.seq_len { backend.matvec_mul(&mut output, &weight, &mut input); }
+        for _ in 0..cfg.seq_len { backend.matmul(&mut output, &weight, &input); }
     }
     backend.sync();
     let elapsed = start.elapsed().as_secs_f64();

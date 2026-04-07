@@ -155,13 +155,15 @@ impl LlamaModel {
         }
     }
 
-    /// Run `tokens` starting at `session.pos` through all layers and populate the KV cache.
-    /// Advances `session.pos` by `tokens.len()`. Returns logits for the last token if
-    /// `want_logits` is true, otherwise `None`.
+    /// Run `tokens` starting at `session.pos` through every layer and populate the KV cache.
+    /// Advances `session.pos` by `tokens.len()`. When `want_logits` is true, populates
+    /// `session.act.logits` with the next-token distribution from the *last* input token.
     ///
-    /// A step is just `{tokens}` against a session. Decode is `tokens.len() == 1`. Prefill is
-    /// `tokens.len() > 1`. When logits are requested the last token always runs through the
-    /// sequential path so its hidden state lands in the persistent activation buffers.
+    /// Decode (`tokens.len() == 1`) reuses the persistent 1-column scratch in `session.act`.
+    /// Prefill (`tokens.len() > 1`) allocates a wider scratch sized to the batch and runs the
+    /// same layer body — the backend dispatches GEMV vs GEMM and flash vs causal attention
+    /// from the input shape. To produce logits we always finish with a 1-column step using
+    /// `session.act` so the output projection sees a 1D hidden state.
     pub fn forward(
         &self,
         backend: &dyn Backend,
@@ -172,17 +174,17 @@ impl LlamaModel {
         if tokens.is_empty() {
             return;
         }
+        assert!(
+            session.pos + tokens.len() <= self.config.max_seq_len,
+            "context overflow: pos={} + tokens={} > max_seq_len={}",
+            session.pos, tokens.len(), self.config.max_seq_len,
+        );
 
         let start_pos = session.pos;
 
-        // Batched GEMM is only a win for unquantized weights with multiple tokens.
-        let unquantized = matches!(
-            self.weights.layers[0].wq.dtype,
-            DType::F32 | DType::BF16 | DType::F16
-        );
-
-        // If logits are requested, peel the last token off so the sequential path
-        // leaves its hidden state in session.act.x for the output projection.
+        // If logits are requested, peel the last token off so the final layer pass
+        // runs through `session.act` (1-column scratch) and leaves its hidden state
+        // in `session.act.x` for the output projection.
         let (batch, tail) = if want_logits {
             (&tokens[..tokens.len() - 1], Some(tokens[tokens.len() - 1]))
         } else {
@@ -190,20 +192,22 @@ impl LlamaModel {
         };
 
         if !batch.is_empty() {
-            if unquantized && batch.len() > 1 {
-                self.forward_batch_gemm(backend, session, batch, start_pos);
-            } else {
-                for (i, &t) in batch.iter().enumerate() {
-                    self.forward_one(backend, session, t, start_pos + i);
-                }
-            }
+            let mut scratch = Scratch::alloc(backend, &self.config, batch.len());
+            self.run_layers(backend, &mut scratch, &mut session.kv_cache, batch, start_pos);
         }
 
         session.pos = start_pos + tokens.len();
 
         let Some(tail_token) = tail else { return };
         let tail_pos = start_pos + batch.len();
-        self.forward_one(backend, session, tail_token, tail_pos);
+        let mut scratch = Scratch::from_act(&mut session.act);
+        self.run_layers(
+            backend,
+            &mut scratch,
+            &mut session.kv_cache,
+            std::slice::from_ref(&tail_token),
+            tail_pos,
+        );
 
         backend.rms_norm(
             &mut session.act.x_norm,
@@ -211,164 +215,158 @@ impl LlamaModel {
             &self.weights.output_norm,
             self.config.norm_eps,
         );
-        backend.matvec_mul(
+        backend.matmul(
             &mut session.act.logits,
             &self.weights.output_weight,
             &session.act.x_norm,
         );
     }
 
-    /// Run one token through all transformer layers, populating the KV cache.
-    /// Leaves the post-FFN hidden state in `session.act.x`.
-    fn forward_one(&self, backend: &dyn Backend, session: &mut Session, token: u32, pos: usize) {
-        let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        // Split-borrow disjoint fields so we can pass &act.X and &mut kv_cache together.
-        let act = &mut session.act;
-        let kv_cache = &mut session.kv_cache;
+    /// Run `tokens` (length 1 for decode, >1 for prefill) through every layer using `s` as
+    /// scratch. Backend ops are shape-agnostic — the same calls work in both modes.
+    fn run_layers(
+        &self,
+        backend: &dyn Backend,
+        s: &mut Scratch<'_>,
+        kv_cache: &mut KVCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) {
+        let kv_dim = self.config.n_kv_heads * self.config.head_dim;
 
-        backend.embed(&mut act.x, &self.weights.token_embedding, token);
+        backend.embed(s.x, &self.weights.token_embedding, tokens);
 
         for layer_idx in 0..self.config.n_layers {
             let layer = &self.weights.layers[layer_idx];
 
             // Attention
-            backend.rms_norm(
-                &mut act.x_norm,
-                &act.x,
-                &layer.attn_norm,
-                self.config.norm_eps,
-            );
-            backend.matvec_mul(&mut act.q, &layer.wq, &act.x_norm);
-            backend.matvec_mul(&mut act.k, &layer.wk, &act.x_norm);
-            backend.matvec_mul(&mut act.v, &layer.wv, &act.x_norm);
-            backend.rope(
-                &mut act.q,
-                &mut act.k,
-                pos,
-                head_dim,
-                self.config.rope_theta,
-            );
+            backend.rms_norm(s.x_norm, s.x, &layer.attn_norm, self.config.norm_eps);
+            backend.matmul(s.q, &layer.wq, s.x_norm);
+            backend.matmul(s.k, &layer.wk, s.x_norm);
+            backend.matmul(s.v, &layer.wv, s.x_norm);
+            backend.rope(s.q, s.k, start_pos, self.config.head_dim, self.config.rope_theta);
 
-            kv_cache.store(backend, layer_idx, pos, &act.k, &act.v);
+            backend.copy_into(&mut kv_cache.k_cache[layer_idx], s.k, start_pos * kv_dim);
+            backend.copy_into(&mut kv_cache.v_cache[layer_idx], s.v, start_pos * kv_dim);
 
-            backend.gqa_attention(
-                &mut act.attn_out,
-                &act.q,
+            backend.attention(
+                s.attn_out,
+                s.q,
                 &kv_cache.k_cache[layer_idx],
                 &kv_cache.v_cache[layer_idx],
-                pos,
-                n_heads,
-                self.config.n_kv_heads,
-                head_dim,
-            );
-
-            backend.matvec_mul(&mut act.wo_out, &layer.wo, &act.attn_out);
-            backend.add(&mut act.x2, &act.x, &act.wo_out);
-
-            // FFN
-            backend.rms_norm(
-                &mut act.x_norm,
-                &act.x2,
-                &layer.ffn_norm,
-                self.config.norm_eps,
-            );
-            backend.matvec_mul(&mut act.gate, &layer.w1, &act.x_norm);
-            backend.matvec_mul(&mut act.up, &layer.w3, &act.x_norm);
-            backend.silu(&mut act.gate);
-            backend.mul(&mut act.gate_up, &act.gate, &act.up);
-            backend.matvec_mul(&mut act.ffn_out, &layer.w2, &act.gate_up);
-
-            backend.add(&mut act.x, &act.x2, &act.ffn_out);
-        }
-    }
-
-    /// Run a batch of tokens through all layers via batched GEMM, storing KV cache.
-    /// Caller is responsible for choosing this path only when it's actually faster
-    /// (unquantized weights, seq_len > 1).
-    fn forward_batch_gemm(
-        &self,
-        backend: &dyn Backend,
-        session: &mut Session,
-        tokens: &[u32],
-        start_pos: usize,
-    ) {
-        let seq_len = tokens.len();
-        let dim = self.config.dim as u64;
-        let kv_dim = (self.config.n_kv_heads * self.config.head_dim) as u64;
-        let hidden_dim = self.config.hidden_dim as u64;
-        let n = seq_len as u64;
-
-        let mut x = backend.alloc(&[dim, n], DType::BF16);
-        let mut x_norm = backend.alloc(&[dim, n], DType::BF16);
-        let mut q = backend.alloc(&[dim, n], DType::BF16);
-        let mut k = backend.alloc(&[kv_dim, n], DType::BF16);
-        let mut v = backend.alloc(&[kv_dim, n], DType::BF16);
-        let mut attn_out = backend.alloc(&[dim, n], DType::BF16);
-        let mut wo_out = backend.alloc(&[dim, n], DType::BF16);
-        let mut x2 = backend.alloc(&[dim, n], DType::BF16);
-        let mut gate = backend.alloc(&[hidden_dim, n], DType::BF16);
-        let mut up = backend.alloc(&[hidden_dim, n], DType::BF16);
-        let mut gate_up = backend.alloc(&[hidden_dim, n], DType::BF16);
-        let mut ffn_out = backend.alloc(&[dim, n], DType::BF16);
-
-        backend.embed_batch(&mut x, &self.weights.token_embedding, tokens);
-
-        for layer_idx in 0..self.config.n_layers {
-            let layer = &self.weights.layers[layer_idx];
-
-            backend.rms_norm_batch(
-                &mut x_norm,
-                &x,
-                &layer.attn_norm,
-                self.config.norm_eps,
-                seq_len,
-            );
-            backend.matmul(&mut q, &layer.wq, &x_norm);
-            backend.matmul(&mut k, &layer.wk, &x_norm);
-            backend.matmul(&mut v, &layer.wv, &x_norm);
-            backend.rope_batch(
-                &mut q,
-                &mut k,
                 start_pos,
-                seq_len,
-                self.config.head_dim,
-                self.config.rope_theta,
-            );
-
-            let kv_offset = start_pos * kv_dim as usize;
-            backend.copy_into(&mut session.kv_cache.k_cache[layer_idx], &k, kv_offset);
-            backend.copy_into(&mut session.kv_cache.v_cache[layer_idx], &v, kv_offset);
-
-            backend.gqa_attention_batch(
-                &mut attn_out,
-                &q,
-                &session.kv_cache.k_cache[layer_idx],
-                &session.kv_cache.v_cache[layer_idx],
-                start_pos,
-                seq_len,
                 self.config.n_heads,
                 self.config.n_kv_heads,
                 self.config.head_dim,
             );
 
-            backend.matmul(&mut wo_out, &layer.wo, &attn_out);
-            backend.add(&mut x2, &x, &wo_out);
+            backend.matmul(s.wo_out, &layer.wo, s.attn_out);
+            backend.add(s.x2, s.x, s.wo_out);
 
-            backend.rms_norm_batch(
-                &mut x_norm,
-                &x2,
-                &layer.ffn_norm,
-                self.config.norm_eps,
-                seq_len,
-            );
-            backend.matmul(&mut gate, &layer.w1, &x_norm);
-            backend.matmul(&mut up, &layer.w3, &x_norm);
-            backend.silu(&mut gate);
-            backend.mul(&mut gate_up, &gate, &up);
-            backend.matmul(&mut ffn_out, &layer.w2, &gate_up);
+            // FFN
+            backend.rms_norm(s.x_norm, s.x2, &layer.ffn_norm, self.config.norm_eps);
+            backend.matmul(s.gate, &layer.w1, s.x_norm);
+            backend.matmul(s.up, &layer.w3, s.x_norm);
+            backend.silu(s.gate);
+            backend.mul(s.gate_up, s.gate, s.up);
+            backend.matmul(s.ffn_out, &layer.w2, s.gate_up);
 
-            backend.add(&mut x, &x2, &ffn_out);
+            backend.add(s.x, s.x2, s.ffn_out);
+        }
+    }
+}
+
+/// View over the per-step scratch buffers needed by `run_layers`. Either borrows
+/// `Activations` (decode, persistent) or owns freshly-allocated 2D buffers (prefill).
+struct Scratch<'a> {
+    x: &'a mut DeviceBuffer,
+    x_norm: &'a mut DeviceBuffer,
+    q: &'a mut DeviceBuffer,
+    k: &'a mut DeviceBuffer,
+    v: &'a mut DeviceBuffer,
+    attn_out: &'a mut DeviceBuffer,
+    wo_out: &'a mut DeviceBuffer,
+    x2: &'a mut DeviceBuffer,
+    gate: &'a mut DeviceBuffer,
+    up: &'a mut DeviceBuffer,
+    gate_up: &'a mut DeviceBuffer,
+    ffn_out: &'a mut DeviceBuffer,
+    _own: Option<Box<OwnedScratch>>,
+}
+
+struct OwnedScratch {
+    x: DeviceBuffer,
+    x_norm: DeviceBuffer,
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    attn_out: DeviceBuffer,
+    wo_out: DeviceBuffer,
+    x2: DeviceBuffer,
+    gate: DeviceBuffer,
+    up: DeviceBuffer,
+    gate_up: DeviceBuffer,
+    ffn_out: DeviceBuffer,
+}
+
+impl<'a> Scratch<'a> {
+    fn from_act(act: &'a mut Activations) -> Scratch<'a> {
+        Scratch {
+            x: &mut act.x,
+            x_norm: &mut act.x_norm,
+            q: &mut act.q,
+            k: &mut act.k,
+            v: &mut act.v,
+            attn_out: &mut act.attn_out,
+            wo_out: &mut act.wo_out,
+            x2: &mut act.x2,
+            gate: &mut act.gate,
+            up: &mut act.up,
+            gate_up: &mut act.gate_up,
+            ffn_out: &mut act.ffn_out,
+            _own: None,
+        }
+    }
+
+    fn alloc(backend: &dyn Backend, config: &ModelConfig, seq_len: usize) -> Scratch<'a> {
+        let dim = config.dim as u64;
+        let kv_dim = (config.n_kv_heads * config.head_dim) as u64;
+        let hidden = config.hidden_dim as u64;
+        let n = seq_len as u64;
+        let mut owned = Box::new(OwnedScratch {
+            x: backend.alloc(&[dim, n], DType::BF16),
+            x_norm: backend.alloc(&[dim, n], DType::BF16),
+            q: backend.alloc(&[dim, n], DType::BF16),
+            k: backend.alloc(&[kv_dim, n], DType::BF16),
+            v: backend.alloc(&[kv_dim, n], DType::BF16),
+            attn_out: backend.alloc(&[dim, n], DType::BF16),
+            wo_out: backend.alloc(&[dim, n], DType::BF16),
+            x2: backend.alloc(&[dim, n], DType::BF16),
+            gate: backend.alloc(&[hidden, n], DType::BF16),
+            up: backend.alloc(&[hidden, n], DType::BF16),
+            gate_up: backend.alloc(&[hidden, n], DType::BF16),
+            ffn_out: backend.alloc(&[dim, n], DType::BF16),
+        });
+        // Reborrow each field through the box's stable address. SAFETY: the box
+        // outlives the returned Scratch (it's stored in `_own`) and the references
+        // are disjoint, so this is sound.
+        let p = &mut *owned as *mut OwnedScratch;
+        unsafe {
+            Scratch {
+                x: &mut (*p).x,
+                x_norm: &mut (*p).x_norm,
+                q: &mut (*p).q,
+                k: &mut (*p).k,
+                v: &mut (*p).v,
+                attn_out: &mut (*p).attn_out,
+                wo_out: &mut (*p).wo_out,
+                x2: &mut (*p).x2,
+                gate: &mut (*p).gate,
+                up: &mut (*p).up,
+                gate_up: &mut (*p).gate_up,
+                ffn_out: &mut (*p).ffn_out,
+                _own: Some(owned),
+            }
         }
     }
 }

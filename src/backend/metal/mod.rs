@@ -87,11 +87,6 @@ impl MetalBackend {
         let library = load_metal_library(&device);
 
         let names: &[&str] = &[
-            "embed_f32",
-            "embed_bf16",
-            "embed_f16",
-            "embed_q4k",
-            "embed_q6k",
             "matvec_f32_simd",
             "matvec_bf16_simd",
             "matvec_f16_simd",
@@ -99,9 +94,6 @@ impl MetalBackend {
             "matvec_q8_0_simd",
             "matvec_q4k_simd",
             "matvec_q6k_simd",
-            "rms_norm",
-            "rope",
-            "softmax_kernel",
             "silu_inplace",
             "add_vecs",
             "mul_vecs",
@@ -117,12 +109,8 @@ impl MetalBackend {
             "gemm_f32",
             "gemm_bf16",
             "gemm_f16",
-            "gemm_q4_0",
-            "gemm_q8_0",
-            "gemm_q4k",
-            "gemm_q6k",
             "causal_attention",
-            "argmax_bf16",
+            "argmax",
         ];
 
         let t0 = std::time::Instant::now();
@@ -325,6 +313,12 @@ impl MetalBackend {
     }
 }
 
+/// Number of columns in a buffer. 1D shapes (decode) → 1, 2D shapes (prefill) → shape[1].
+/// This is the only thing the backend needs to tell decode and prefill apart.
+fn seq_len_of(buf: &DeviceBuffer) -> usize {
+    if buf.shape.len() > 1 { buf.shape[1] as usize } else { 1 }
+}
+
 fn sz(w: usize, h: usize, d: usize) -> MTLSize {
     MTLSize {
         width: w,
@@ -408,51 +402,50 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn matvec_mul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer) {
-        let kernel = match weight.dtype {
-            DType::F32 => "matvec_f32_simd",
-            DType::BF16 => "matvec_bf16_simd",
-            DType::F16 => "matvec_f16_simd",
-            DType::Q4_0 => "matvec_q4_0_simd",
-            DType::Q8_0 => "matvec_q8_0_simd",
-            DType::Q4K => "matvec_q4k_simd",
-            DType::Q6K => "matvec_q6k_simd",
-            _ => unimplemented!("matvec for {:?}", weight.dtype),
-        };
-        let in_f = weight.shape[0] as u32;
-        let out_f = weight.shape[1] as u32;
-        // Optimized kernels: NR rows per simdgroup, NSG simdgroups per threadgroup
-        let (nr, nsg) = match weight.dtype {
-            DType::Q4K | DType::Q6K => (2, 4),
-            DType::BF16 | DType::F16 => (2, 4),
-            _ => (1, 8), // original: 1 row per simdgroup, 8 simdgroups
-        };
-        let rows_per_tg = nr * nsg;
-        let n_tg = (out_f as usize + rows_per_tg - 1) / rows_per_tg;
-        self.encode_groups(
-            kernel,
-            sz(n_tg, 1, 1),
-            sz(nsg * 32, 1, 1),
-            0,
-            |enc| unsafe {
-                set_buf(enc, weight, 0);
-                set_buf(enc, input, 1);
-                set_buf(enc, out, 2);
-                set_u32(enc, in_f, 3);
-                set_u32(enc, out_f, 4);
-            },
-        );
-
-        let weight_bytes = weight.dtype.storage_size(in_f as usize * out_f as usize);
-        let input_bytes = input.dtype.storage_size(in_f as usize);
-        let output_bytes = out.dtype.storage_size(out_f as usize);
-        self.perf_log(kernel, weight_bytes + input_bytes + output_bytes, 2 * in_f as usize * out_f as usize);
-    }
-
     fn matmul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer) {
         let in_f = weight.shape[0] as u32;
         let out_f = weight.shape[1] as u32;
-        let seq_len = input.shape[1] as u32;
+        let seq_len = seq_len_of(input) as u32;
+
+        // Decode (single column): always dispatch the optimized SIMD matvec.
+        if seq_len == 1 {
+            let kernel = match weight.dtype {
+                DType::F32 => "matvec_f32_simd",
+                DType::BF16 => "matvec_bf16_simd",
+                DType::F16 => "matvec_f16_simd",
+                DType::Q4_0 => "matvec_q4_0_simd",
+                DType::Q8_0 => "matvec_q8_0_simd",
+                DType::Q4K => "matvec_q4k_simd",
+                DType::Q6K => "matvec_q6k_simd",
+                _ => unimplemented!("matvec for {:?}", weight.dtype),
+            };
+            let (nr, nsg) = match weight.dtype {
+                DType::Q4K | DType::Q6K => (2, 4),
+                DType::BF16 | DType::F16 => (2, 4),
+                _ => (1, 8),
+            };
+            let rows_per_tg = nr * nsg;
+            let n_tg = (out_f as usize + rows_per_tg - 1) / rows_per_tg;
+            self.encode_groups(
+                kernel,
+                sz(n_tg, 1, 1),
+                sz(nsg * 32, 1, 1),
+                0,
+                |enc| unsafe {
+                    set_buf(enc, weight, 0);
+                    set_buf(enc, input, 1);
+                    set_buf(enc, out, 2);
+                    set_u32(enc, in_f, 3);
+                    set_u32(enc, out_f, 4);
+                },
+            );
+
+            let weight_bytes = weight.dtype.storage_size(in_f as usize * out_f as usize);
+            let input_bytes = input.dtype.storage_size(in_f as usize);
+            let output_bytes = out.dtype.storage_size(out_f as usize);
+            self.perf_log(kernel, weight_bytes + input_bytes + output_bytes, 2 * in_f as usize * out_f as usize);
+            return;
+        }
 
         // For quantized types, GEMM is slower than sequential matvec because
         // quantized weights are tiny (~0.5 bytes/elem for Q4K) so F32 input reads
@@ -573,72 +566,64 @@ impl Backend for MetalBackend {
         weight: &DeviceBuffer,
         eps: f32,
     ) {
-        let dim = input.n_elements() as u32;
+        let dim = weight.n_elements() as u32;
+        let seq_len = seq_len_of(input);
         let tg = 1024usize.min(dim as usize);
-        let shared = (((tg as usize) + 31) / 32) * 4;
-        self.encode_groups("rms_norm", sz(1, 1, 1), sz(tg, 1, 1), shared, |enc| unsafe {
-            set_buf(enc, input, 0);
-            set_buf(enc, weight, 1);
-            set_buf(enc, out, 2);
-            set_u32(enc, dim, 3);
-            set_f32(enc, eps, 4);
-        });
+        let shared = (((tg) + 31) / 32) * 4;
+        self.encode_groups(
+            "rms_norm_batch",
+            sz(seq_len, 1, 1),
+            sz(tg, 1, 1),
+            shared,
+            |enc| unsafe {
+                set_buf(enc, input, 0);
+                set_buf(enc, weight, 1);
+                set_buf(enc, out, 2);
+                set_u32(enc, dim, 3);
+                set_f32(enc, eps, 4);
+            },
+        );
 
         let d = dim as usize;
-        let act_bytes = input.dtype.storage_size(d);
-        self.perf_log("rms_norm", act_bytes * 2 + weight.dtype.storage_size(d), 5 * d);
+        let act_bytes = input.dtype.storage_size(d * seq_len);
+        self.perf_log("rms_norm", act_bytes * 2 + weight.dtype.storage_size(d), 5 * d * seq_len);
     }
 
     fn rope(
         &self,
         q: &mut DeviceBuffer,
         k: &mut DeviceBuffer,
-        pos: usize,
+        start_pos: usize,
         head_dim: usize,
         rope_theta: f32,
     ) {
-        let pos = pos as u32;
-        let hd = head_dim as u32;
+        let seq_len = seq_len_of(q);
 
-        let q_pairs = (q.n_elements() / 2) as u32;
-        self.encode("rope", sz(q_pairs as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, q, 0);
-            set_u32(enc, pos, 1);
-            set_u32(enc, hd, 2);
-            set_f32(enc, rope_theta, 3);
-            set_u32(enc, q_pairs, 4);
-        });
-
-        let k_pairs = (k.n_elements() / 2) as u32;
-        self.encode("rope", sz(k_pairs as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, k, 0);
-            set_u32(enc, pos, 1);
-            set_u32(enc, hd, 2);
-            set_f32(enc, rope_theta, 3);
-            set_u32(enc, k_pairs, 4);
-        });
+        let dispatch = |buf: &mut DeviceBuffer| {
+            let total = buf.n_elements();
+            let row_stride = total / seq_len;
+            let pairs_per_row = row_stride / 2;
+            self.encode(
+                "rope_batch",
+                sz(pairs_per_row, seq_len, 1),
+                sz(256, 1, 1),
+                0,
+                |enc| unsafe {
+                    set_buf(enc, buf, 0);
+                    set_u32(enc, start_pos as u32, 1);
+                    set_u32(enc, head_dim as u32, 2);
+                    set_f32(enc, rope_theta, 3);
+                    set_u32(enc, pairs_per_row as u32, 4);
+                    set_u32(enc, row_stride as u32, 5);
+                },
+            );
+        };
+        dispatch(q);
+        dispatch(k);
 
         let total_n = q.n_elements() + k.n_elements();
         let elem_size = q.dtype.storage_size(1);
         self.perf_log("rope", total_n * elem_size * 2, total_n / 2 * 10);
-    }
-
-    fn softmax(&self, x: &mut DeviceBuffer, len: usize) {
-        let len_u32 = len as u32;
-        let tg = 1024usize.min(len);
-        let shared = (((tg as usize) + 31) / 32) * 4;
-        self.encode_groups(
-            "softmax_kernel",
-            sz(1, 1, 1),
-            sz(tg, 1, 1),
-            shared,
-            |enc| unsafe {
-                set_buf(enc, x, 0);
-                set_u32(enc, len_u32, 1);
-            },
-        );
-
-        self.perf_log("softmax", x.dtype.storage_size(len) * 2, 5 * len);
     }
 
     fn silu(&self, x: &mut DeviceBuffer) {
@@ -680,7 +665,7 @@ impl Backend for MetalBackend {
         let n = logits.n_elements() as u32;
         let out = self.alloc(&[1], DType::I32);
         self.encode_groups(
-            "argmax_bf16",
+            "argmax",
             sz(1, 1, 1),
             sz(256, 1, 1),
             0,
@@ -696,67 +681,113 @@ impl Backend for MetalBackend {
         unsafe { *ptr }
     }
 
-    fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_id: u32) {
+    fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, tokens: &[u32]) {
+        let seq_len = tokens.len();
+        let token_buf = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new_unchecked(tokens.as_ptr() as *mut _),
+                tokens.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("Failed to create tokens buffer");
+
         let kernel = match table.dtype {
-            DType::F32 => "embed_f32",
-            DType::BF16 => "embed_bf16",
-            DType::F16 => "embed_f16",
-            DType::Q4K => "embed_q4k",
-            DType::Q6K => "embed_q6k",
+            DType::F32 => "embed_batch_f32",
+            DType::BF16 => "embed_batch_bf16",
+            DType::F16 => "embed_batch_f16",
+            DType::Q4K => "embed_batch_q4k",
+            DType::Q6K => "embed_batch_q6k",
             _ => unimplemented!("embed for {:?}", table.dtype),
         };
         let dim = table.shape[0] as u32;
-        self.encode(kernel, sz(dim as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, table, 0);
-            set_buf(enc, out, 1);
-            set_u32(enc, token_id, 2);
-            set_u32(enc, dim, 3);
-        });
+
+        self.encode(
+            kernel,
+            sz(dim as usize, seq_len, 1),
+            sz(256, 1, 1),
+            0,
+            |enc| unsafe {
+                set_buf(enc, table, 0);
+                enc.setBuffer_offset_atIndex(Some(&token_buf), 0, 1);
+                set_buf(enc, out, 2);
+                set_u32(enc, dim, 3);
+                set_u32(enc, seq_len as u32, 4);
+            },
+        );
 
         let row_bytes = table.dtype.storage_size(dim as usize);
-        self.perf_log(kernel, row_bytes + out.dtype.storage_size(dim as usize), 0);
+        self.perf_log(kernel, (row_bytes + out.dtype.storage_size(dim as usize)) * seq_len, 0);
     }
 
-    fn gqa_attention(
+    fn attention(
         &self,
         out: &mut DeviceBuffer,
         q: &DeviceBuffer,
         k_cache: &DeviceBuffer,
         v_cache: &DeviceBuffer,
-        pos: usize,
+        start_pos: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
     ) {
+        let seq_len = seq_len_of(q);
         let kv_dim = (n_kv_heads * head_dim) as u32;
         let fa_block = 32;
         let n_simdgroups = (head_dim + 31) / 32;
         let shared_mem = (fa_block + n_simdgroups) * 4;
-        self.encode_groups(
-            "flash_attention",
-            sz(n_heads, 1, 1),
-            sz(head_dim, 1, 1),
-            shared_mem,
-            |enc| unsafe {
-                set_buf(enc, q, 0);
-                set_buf(enc, k_cache, 1);
-                set_buf(enc, v_cache, 2);
-                set_buf(enc, out, 3);
-                set_u32(enc, pos as u32, 4);
-                set_u32(enc, n_heads as u32, 5);
-                set_u32(enc, n_kv_heads as u32, 6);
-                set_u32(enc, head_dim as u32, 7);
-                set_u32(enc, kv_dim, 8);
-            },
-        );
 
-        let seq_len = pos + 1;
-        let elem = q.dtype.storage_size(1);
-        let bytes = n_heads * head_dim * elem
-            + seq_len * n_kv_heads * head_dim * elem * 2
-            + n_heads * head_dim * elem;
-        let flops = n_heads * seq_len * head_dim * 4;
-        self.perf_log("flash_attention", bytes, flops);
+        if seq_len == 1 {
+            // Decode: single-query flash attention.
+            self.encode_groups(
+                "flash_attention",
+                sz(n_heads, 1, 1),
+                sz(head_dim, 1, 1),
+                shared_mem,
+                |enc| unsafe {
+                    set_buf(enc, q, 0);
+                    set_buf(enc, k_cache, 1);
+                    set_buf(enc, v_cache, 2);
+                    set_buf(enc, out, 3);
+                    set_u32(enc, start_pos as u32, 4);
+                    set_u32(enc, n_heads as u32, 5);
+                    set_u32(enc, n_kv_heads as u32, 6);
+                    set_u32(enc, head_dim as u32, 7);
+                    set_u32(enc, kv_dim, 8);
+                },
+            );
+            let kv_len = start_pos + 1;
+            let elem = q.dtype.storage_size(1);
+            let bytes = n_heads * head_dim * elem * 2 + kv_len * n_kv_heads * head_dim * elem * 2;
+            self.perf_log("flash_attention", bytes, n_heads * kv_len * head_dim * 4);
+        } else {
+            // Prefill: causal attention over `seq_len` query columns.
+            let n_tg = n_heads * seq_len;
+            self.encode_groups(
+                "causal_attention",
+                sz(n_tg, 1, 1),
+                sz(head_dim, 1, 1),
+                shared_mem,
+                |enc| unsafe {
+                    set_buf(enc, q, 0);
+                    set_buf(enc, k_cache, 1);
+                    set_buf(enc, v_cache, 2);
+                    set_buf(enc, out, 3);
+                    set_u32(enc, start_pos as u32, 4);
+                    set_u32(enc, seq_len as u32, 5);
+                    set_u32(enc, n_heads as u32, 6);
+                    set_u32(enc, n_kv_heads as u32, 7);
+                    set_u32(enc, head_dim as u32, 8);
+                    set_u32(enc, kv_dim, 9);
+                    set_u32(enc, n_heads as u32, 10);
+                },
+            );
+            let kv_len = start_pos + seq_len;
+            let elem = q.dtype.storage_size(1);
+            let bytes = n_heads * seq_len * head_dim * elem * 2
+                + kv_len * n_kv_heads * head_dim * elem * 2;
+            self.perf_log("causal_attention", bytes, n_heads * seq_len * kv_len * head_dim * 4);
+        }
     }
 
     fn copy_into(&self, dst: &mut DeviceBuffer, src: &DeviceBuffer, dst_offset_elements: usize) {
@@ -802,175 +833,8 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn embed_batch(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_ids: &[u32]) {
-        let seq_len = token_ids.len();
-        let token_buf = unsafe {
-            self.device.newBufferWithBytes_length_options(
-                NonNull::new_unchecked(token_ids.as_ptr() as *mut _),
-                token_ids.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("Failed to create token_ids buffer");
-
-        let kernel = match table.dtype {
-            DType::F32 => "embed_batch_f32",
-            DType::BF16 => "embed_batch_bf16",
-            DType::F16 => "embed_batch_f16",
-            DType::Q4K => "embed_batch_q4k",
-            DType::Q6K => "embed_batch_q6k",
-            _ => unimplemented!("embed_batch for {:?}", table.dtype),
-        };
-        let dim = table.shape[0] as u32;
-        let seq_u32 = seq_len as u32;
-
-        self.encode(
-            kernel,
-            sz(dim as usize, seq_len, 1),
-            sz(256, 1, 1),
-            0,
-            |enc| unsafe {
-                set_buf(enc, table, 0);
-                enc.setBuffer_offset_atIndex(Some(&token_buf), 0, 1);
-                set_buf(enc, out, 2);
-                set_u32(enc, dim, 3);
-                set_u32(enc, seq_u32, 4);
-            },
-        );
-    }
-
-    fn rms_norm_batch(
-        &self,
-        out: &mut DeviceBuffer,
-        input: &DeviceBuffer,
-        weight: &DeviceBuffer,
-        eps: f32,
-        seq_len: usize,
-    ) {
-        let dim = weight.n_elements() as u32;
-        let tg = 1024usize.min(dim as usize);
-        let shared = (((tg) + 31) / 32) * 4;
-        self.encode_groups(
-            "rms_norm_batch",
-            sz(seq_len, 1, 1),
-            sz(tg, 1, 1),
-            shared,
-            |enc| unsafe {
-                set_buf(enc, input, 0);
-                set_buf(enc, weight, 1);
-                set_buf(enc, out, 2);
-                set_u32(enc, dim, 3);
-                set_f32(enc, eps, 4);
-            },
-        );
-    }
-
-    fn rope_batch(
-        &self,
-        q: &mut DeviceBuffer,
-        k: &mut DeviceBuffer,
-        start_pos: usize,
-        seq_len: usize,
-        head_dim: usize,
-        rope_theta: f32,
-    ) {
-        let q_total = q.n_elements();
-        let q_pairs_per_row = q_total / seq_len / 2;
-        let q_row_stride = q_total / seq_len;
-        self.encode(
-            "rope_batch",
-            sz(q_pairs_per_row, seq_len, 1),
-            sz(256, 1, 1),
-            0,
-            |enc| unsafe {
-                set_buf(enc, q, 0);
-                set_u32(enc, start_pos as u32, 1);
-                set_u32(enc, head_dim as u32, 2);
-                set_f32(enc, rope_theta, 3);
-                set_u32(enc, q_pairs_per_row as u32, 4);
-                set_u32(enc, q_row_stride as u32, 5);
-            },
-        );
-
-        let k_total = k.n_elements();
-        let k_pairs_per_row = k_total / seq_len / 2;
-        let k_row_stride = k_total / seq_len;
-        self.encode(
-            "rope_batch",
-            sz(k_pairs_per_row, seq_len, 1),
-            sz(256, 1, 1),
-            0,
-            |enc| unsafe {
-                set_buf(enc, k, 0);
-                set_u32(enc, start_pos as u32, 1);
-                set_u32(enc, head_dim as u32, 2);
-                set_f32(enc, rope_theta, 3);
-                set_u32(enc, k_pairs_per_row as u32, 4);
-                set_u32(enc, k_row_stride as u32, 5);
-            },
-        );
-    }
-
-    fn gqa_attention_batch(
-        &self,
-        out: &mut DeviceBuffer,
-        q: &DeviceBuffer,
-        k_cache: &DeviceBuffer,
-        v_cache: &DeviceBuffer,
-        start_pos: usize,
-        seq_len: usize,
-        n_heads: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-    ) {
-        let kv_dim = (n_kv_heads * head_dim) as u32;
-        let fa_block = 32;
-        let n_simdgroups = (head_dim + 31) / 32;
-        let shared_mem = (fa_block + n_simdgroups) * 4;
-        let n_tg = n_heads * seq_len;
-        self.encode_groups(
-            "causal_attention",
-            sz(n_tg, 1, 1),
-            sz(head_dim, 1, 1),
-            shared_mem,
-            |enc| unsafe {
-                set_buf(enc, q, 0);
-                set_buf(enc, k_cache, 1);
-                set_buf(enc, v_cache, 2);
-                set_buf(enc, out, 3);
-                set_u32(enc, start_pos as u32, 4);
-                set_u32(enc, seq_len as u32, 5);
-                set_u32(enc, n_heads as u32, 6);
-                set_u32(enc, n_kv_heads as u32, 7);
-                set_u32(enc, head_dim as u32, 8);
-                set_u32(enc, kv_dim, 9);
-                set_u32(enc, n_heads as u32, 10);
-            },
-        );
-    }
-
     fn sync(&self) {
         self.flush();
-    }
-
-    fn write_from_f32(&self, buf: &mut DeviceBuffer, data: &[f32]) {
-        self.flush();
-        let m = buf.inner.downcast_ref::<MetalBuffer>().unwrap();
-        let base = unsafe { (m.buf.contents().as_ptr() as *mut u8).add(m.offset) };
-        match buf.dtype {
-            DType::BF16 => {
-                let ptr = base as *mut u16;
-                for (i, &val) in data.iter().enumerate() {
-                    unsafe { *ptr.add(i) = (val.to_bits() >> 16) as u16; }
-                }
-            }
-            _ => {
-                let ptr = base as *mut f32;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-                }
-            }
-        }
     }
 }
 

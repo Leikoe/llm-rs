@@ -888,7 +888,7 @@ kernel void mul_vecs(
 // Replaces a 128k×4 byte CPU readback with a 4-byte readback for greedy
 // sampling. The full forward+sample stays GPU-resident.
 
-kernel void argmax_bf16(
+kernel void argmax(
     device const bfloat* logits [[buffer(0)]],
     device uint* out            [[buffer(1)]],
     constant uint& n            [[buffer(2)]],
