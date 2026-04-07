@@ -77,7 +77,7 @@ fn run_completion<B: Backend>(
     // Prefill all prompt tokens in one call; logits come back for the last token.
     let start = Instant::now();
     model.forward(backend, session, &tokens, true);
-
+    backend.sync();
     let prefill_time = start.elapsed();
     eprintln!(
         "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
@@ -109,6 +109,7 @@ fn run_completion<B: Backend>(
         model.forward(backend, session, &[next_token], true);
     }
 
+    backend.sync();
     println!();
     let gen_time = gen_start.elapsed();
     let wall = gen_time.as_secs_f64();
