@@ -51,7 +51,7 @@ impl LlamaModel {
         let config = ModelConfig::from_gguf_metadata(&gguf.metadata);
 
         eprintln!(
-            "Loading {} model: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
+            "{} model: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
             config.architecture,
             config.dim,
             config.n_layers,
@@ -60,10 +60,13 @@ impl LlamaModel {
             config.vocab_size
         );
 
-        let load = |name: &str| -> DeviceBuffer {
+        let upload_start = std::time::Instant::now();
+        let mut bytes_uploaded: usize = 0;
+        let mut load = |name: &str| -> DeviceBuffer {
             let tv = gguf
                 .tensor_view(name)
                 .unwrap_or_else(|_| panic!("missing tensor: {name}"));
+            bytes_uploaded += tv.data.len();
             backend.upload_tensor(&tv)
         };
 
@@ -89,6 +92,10 @@ impl LlamaModel {
                 w3: load(&format!("blk.{i}.ffn_up.weight")),
             });
         }
+
+        let elapsed = upload_start.elapsed().as_secs_f64();
+        let gb = bytes_uploaded as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!("Uploaded model weights to backend: {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
         let kv_cache = KVCache::new(backend, &config);
 
@@ -125,9 +132,68 @@ impl LlamaModel {
         }
     }
 
+    /// Run `tokens` starting at `start_pos` through all layers and populate the KV cache.
+    /// Returns logits for the last token if `want_logits` is true, otherwise `None`.
+    ///
+    /// A step is just `{tokens, start_pos}`. Decode is `tokens.len() == 1`. Prefill is
+    /// `tokens.len() > 1`. When logits are requested the last token always runs through
+    /// the sequential path so its hidden state lands in the persistent activation buffers.
+    pub fn forward(
+        &mut self,
+        backend: &dyn Backend,
+        tokens: &[u32],
+        start_pos: usize,
+        want_logits: bool,
+    ) -> Option<Vec<f32>> {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        // Batched GEMM is only a win for unquantized weights with multiple tokens.
+        let unquantized = matches!(
+            self.weights.layers[0].wq.dtype,
+            DType::F32 | DType::BF16 | DType::F16
+        );
+
+        // If logits are requested, peel the last token off so the sequential path
+        // leaves its hidden state in self.act.x for the output projection.
+        let (batch, tail) = if want_logits {
+            (&tokens[..tokens.len() - 1], Some(tokens[tokens.len() - 1]))
+        } else {
+            (tokens, None)
+        };
+
+        if !batch.is_empty() {
+            if unquantized && batch.len() > 1 {
+                self.forward_batch_gemm(backend, batch, start_pos);
+            } else {
+                for (i, &t) in batch.iter().enumerate() {
+                    self.forward_one(backend, t, start_pos + i);
+                }
+            }
+        }
+
+        let tail_token = tail?;
+        let tail_pos = start_pos + batch.len();
+        self.forward_one(backend, tail_token, tail_pos);
+
+        backend.rms_norm(
+            &mut self.act.x_norm,
+            &self.act.x,
+            &self.weights.output_norm,
+            self.config.norm_eps,
+        );
+        backend.matvec_mul(
+            &mut self.act.logits,
+            &self.weights.output_weight,
+            &self.act.x_norm,
+        );
+        Some(backend.read_to_vec_f32(&self.act.logits))
+    }
+
     /// Run one token through all transformer layers, populating the KV cache.
-    /// Does NOT compute logits — use this for prefill tokens where logits aren't needed.
-    pub fn forward_kv_only(&mut self, backend: &dyn Backend, token: u32, pos: usize) {
+    /// Leaves the post-FFN hidden state in `self.act.x`.
+    fn forward_one(&mut self, backend: &dyn Backend, token: u32, pos: usize) {
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
 
@@ -188,29 +254,11 @@ impl LlamaModel {
         }
     }
 
-    /// Run a batch of tokens through all layers, storing KV cache.
-    /// Does NOT compute logits — use this for prefill tokens.
-    /// Uses batched GEMM for unquantized weights (BF16/F16/F32) where weight reuse
-    /// across sequence positions helps. Falls back to sequential forward_kv_only for
-    /// quantized weights where the optimized matvec kernel is faster.
-    pub fn forward_prefill(&mut self, backend: &dyn Backend, tokens: &[u32], start_pos: usize) {
+    /// Run a batch of tokens through all layers via batched GEMM, storing KV cache.
+    /// Caller is responsible for choosing this path only when it's actually faster
+    /// (unquantized weights, seq_len > 1).
+    fn forward_batch_gemm(&mut self, backend: &dyn Backend, tokens: &[u32], start_pos: usize) {
         let seq_len = tokens.len();
-        if seq_len == 0 {
-            return;
-        }
-
-        // For quantized weights, sequential matvec is faster than GEMM
-        let use_gemm = matches!(
-            self.weights.layers[0].wq.dtype,
-            DType::F32 | DType::BF16 | DType::F16
-        );
-        if !use_gemm {
-            for (i, &token) in tokens.iter().enumerate() {
-                self.forward_kv_only(backend, token, start_pos + i);
-            }
-            return;
-        }
-
         let dim = self.config.dim as u64;
         let kv_dim = (self.config.n_kv_heads * self.config.head_dim) as u64;
         let hidden_dim = self.config.hidden_dim as u64;
@@ -289,20 +337,4 @@ impl LlamaModel {
         }
     }
 
-    /// Run one token through the full model and return logits.
-    pub fn forward(&mut self, backend: &dyn Backend, token: u32, pos: usize) -> Vec<f32> {
-        self.forward_kv_only(backend, token, pos);
-        backend.rms_norm(
-            &mut self.act.x_norm,
-            &self.act.x,
-            &self.weights.output_norm,
-            self.config.norm_eps,
-        );
-        backend.matvec_mul(
-            &mut self.act.logits,
-            &self.weights.output_weight,
-            &self.act.x_norm,
-        );
-        backend.read_to_vec_f32(&self.act.logits)
-    }
 }

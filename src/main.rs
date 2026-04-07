@@ -69,14 +69,9 @@ fn run_completion(
     tokens.extend(tokenizer.encode(prompt));
     eprintln!("Prompt tokens: {}", tokens.len());
 
-    // Prefill: batch all prompt tokens except the last through GEMM.
-    // Then forward the last token to get the first set of logits.
+    // Prefill all prompt tokens in one call; logits come back for the last token.
     let start = Instant::now();
-    if tokens.len() > 1 {
-        model.forward_prefill(backend, &tokens[..tokens.len() - 1], 0);
-    }
-    let last_prompt_pos = tokens.len() - 1;
-    let mut logits = model.forward(backend, tokens[last_prompt_pos], last_prompt_pos);
+    let mut logits = model.forward(backend, &tokens, 0, true).unwrap();
     let mut pos = tokens.len();
 
     let prefill_time = start.elapsed();
@@ -106,7 +101,7 @@ fn run_completion(
         io::stdout().flush().unwrap();
 
         generated += 1;
-        logits = model.forward(backend, next_token, pos);
+        logits = model.forward(backend, &[next_token], pos, true).unwrap();
         pos += 1;
     }
 
@@ -131,19 +126,14 @@ fn run_chat(
     let stdin = io::stdin();
     let mut pos = 0;
 
-    // BOS token
-    model.forward_kv_only(backend, tokenizer.bos_id, pos);
-    pos += 1;
-
-    // System prompt
+    // BOS + optional system prompt, prefilled in one call.
+    let mut warmup = vec![tokenizer.bos_id];
     if let Some(sys) = system_prompt {
         let sys_text = format!("<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>");
-        let sys_tokens = tokenizer.encode(&sys_text);
-        for &token in &sys_tokens {
-            model.forward_kv_only(backend, token, pos);
-            pos += 1;
-        }
+        warmup.extend(tokenizer.encode(&sys_text));
     }
+    model.forward(backend, &warmup, pos, false);
+    pos += warmup.len();
 
     eprintln!("Chat mode. Type your message and press Enter. Ctrl+D to exit.\n");
 
@@ -166,15 +156,9 @@ fn run_chat(
         );
         let user_tokens = tokenizer.encode(&user_text);
 
-        // Prefill user message (all but last token) with batched GEMM
-        if user_tokens.len() > 1 {
-            model.forward_prefill(backend, &user_tokens[..user_tokens.len() - 1], pos);
-            pos += user_tokens.len() - 1;
-        }
-
-        // Forward last user token to get initial logits
-        let mut logits = model.forward(backend, *user_tokens.last().unwrap(), pos);
-        pos += 1;
+        // Prefill user message in one call; logits come back for the last token.
+        let mut logits = model.forward(backend, &user_tokens, pos, true).unwrap();
+        pos += user_tokens.len();
 
         // Generate response
         loop {
@@ -188,7 +172,7 @@ fn run_chat(
             io::stdout().write_all(&piece).unwrap();
             io::stdout().flush().unwrap();
 
-            logits = model.forward(backend, next_token, pos);
+            logits = model.forward(backend, &[next_token], pos, true).unwrap();
             pos += 1;
         }
 

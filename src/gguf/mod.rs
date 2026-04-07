@@ -132,7 +132,7 @@ impl GgufFile {
 
         let gb = file_size as f64 / (1024.0 * 1024.0 * 1024.0);
         let elapsed = start.elapsed().as_secs_f64();
-        eprintln!("Read {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
+        eprintln!("Read model weights into RAM: {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
         let mut cursor = Cursor::new(data.as_slice());
 
