@@ -85,6 +85,12 @@ impl Session {
             act: Activations::new(backend, config),
         }
     }
+
+    /// On-device logits buffer for the most recent forward call. Only valid
+    /// when forward was called with `want_logits = true`.
+    pub fn logits(&self) -> &DeviceBuffer {
+        &self.act.logits
+    }
 }
 
 impl LlamaModel {
@@ -162,9 +168,9 @@ impl LlamaModel {
         session: &mut Session,
         tokens: &[u32],
         want_logits: bool,
-    ) -> Option<Vec<f32>> {
+    ) {
         if tokens.is_empty() {
-            return None;
+            return;
         }
 
         let start_pos = session.pos;
@@ -195,7 +201,7 @@ impl LlamaModel {
 
         session.pos = start_pos + tokens.len();
 
-        let tail_token = tail?;
+        let Some(tail_token) = tail else { return };
         let tail_pos = start_pos + batch.len();
         self.forward_one(backend, session, tail_token, tail_pos);
 
@@ -210,7 +216,6 @@ impl LlamaModel {
             &self.weights.output_weight,
             &session.act.x_norm,
         );
-        Some(backend.read_to_vec_f32(&session.act.logits))
     }
 
     /// Run one token through all transformer layers, populating the KV cache.

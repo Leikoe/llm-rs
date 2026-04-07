@@ -56,6 +56,16 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn argmax(&self, logits: &DeviceBuffer) -> u32 {
+        let v = self.read_to_vec_f32(logits);
+        let mut best_i = 0u32;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &x) in v.iter().enumerate() {
+            if x > best_v { best_v = x; best_i = i as u32; }
+        }
+        best_i
+    }
+
     fn matvec_mul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer) {
         // GGML shape: [in_features, out_features] — out_features rows of in_features elements.
         let in_features = weight.shape[0] as usize;

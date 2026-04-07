@@ -880,6 +880,48 @@ kernel void mul_vecs(
     if (tid < len) out[tid] = bfloat(float(a[tid]) * float(b[tid]));
 }
 
+// ===================== Argmax =====================
+//
+// Reduce a logit vector to the index of its maximum value. Single threadgroup,
+// 256 threads, tree reduction in static threadgroup memory. Result is one u32.
+//
+// Replaces a 128k×4 byte CPU readback with a 4-byte readback for greedy
+// sampling. The full forward+sample stays GPU-resident.
+
+kernel void argmax_bf16(
+    device const bfloat* logits [[buffer(0)]],
+    device uint* out            [[buffer(1)]],
+    constant uint& n            [[buffer(2)]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float shared_val[256];
+    threadgroup uint  shared_idx[256];
+
+    float best_v = -INFINITY;
+    uint  best_i = 0;
+    for (uint i = tid; i < n; i += tg_size) {
+        float v = float(logits[i]);
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    shared_val[tid] = best_v;
+    shared_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other_v = shared_val[tid + stride];
+            if (other_v > shared_val[tid]) {
+                shared_val[tid] = other_v;
+                shared_idx[tid] = shared_idx[tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) out[0] = shared_idx[0];
+}
+
 // ===================== Copy with offset =====================
 
 kernel void copy_offset(

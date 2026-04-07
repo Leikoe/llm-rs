@@ -22,6 +22,16 @@ pub trait Backend {
     fn upload_tensor(&self, tv: &TensorView) -> DeviceBuffer;
     fn alloc(&self, shape: &[u64], dtype: DType) -> DeviceBuffer;
 
+    /// Total GPU execution time accumulated since the last reset. Default 0
+    /// for backends that don't track this (CPU). Used to measure encode/sync
+    /// overhead = wall_time - gpu_secs_total.
+    fn gpu_secs_total(&self) -> f64 { 0.0 }
+    fn reset_gpu_secs(&self) {}
+
+    /// Index of the maximum logit. Greedy sampling, fully on-device — replaces
+    /// a vocab-sized readback with a 4-byte one.
+    fn argmax(&self, logits: &DeviceBuffer) -> u32;
+
     /// Matrix-vector multiply: out = weight @ input.
     /// GGML shape: weight is [in_features, out_features] in memory.
     /// Weight may be quantized. The kernel handles dequantization.

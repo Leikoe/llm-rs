@@ -10,6 +10,25 @@ High-performance LLM inference engine in Rust targeting Apple Metal (primary) an
 - Fewer lines > more lines. Fewer abstractions > more abstractions. Fewer dependencies > more dependencies.
 - If you need a comment to explain what the code does, the code is too clever.
 
+## Taste
+
+We are building software with **taste**. The bar isn't "it works" — it's
+beautifully simple, immaculately designed, immaculately implemented. Code
+should feel inevitable: the kind of thing where, after reading it, you can't
+imagine it being written any other way.
+
+**Naming matters more than anything else.** Names are the base of all
+understanding and communication. A well-named type, function, or variable
+makes the code teach itself. A badly-named one creates confusion that no
+amount of documentation can fix. Spend disproportionate time on names. If
+you can't name a thing well, you probably don't understand it well enough
+to write it yet.
+
+- Prefer concrete, specific names over generic ones (`Session`, not `Context`).
+- Prefer the shortest name that's still unambiguous in its scope.
+- A function name should describe what it returns or what it does, not how.
+- If renaming a thing would make the code clearer, rename it. Always.
+
 ## Simplicity budget
 
 We are explicitly NOT trying to become vLLM, llama.cpp, or any other engine
@@ -19,8 +38,8 @@ back on growth that doesn't pay for itself.
 
 | Metric                       | Current | Soft cap |
 |------------------------------|---------|----------|
-| Rust LOC (`src/**/*.rs`)     |   3361  |   6000   |
-| Metal LOC (`shaders/*.metal`)|   1456  |   3000   |
+| Rust LOC (`src/**/*.rs`)     |   3421  |   6000   |
+| Metal LOC (`shaders/*.metal`)|   1498  |   3000   |
 | Non-Apple deps (Cargo.toml)  |     3   |     5    |
 
 When you cross a soft cap, stop and ask whether the new code is paying for

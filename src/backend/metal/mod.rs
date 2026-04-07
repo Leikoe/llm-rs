@@ -73,7 +73,11 @@ pub struct MetalBackend {
     cmd: RefCell<Option<CmdState>>,
     perf: bool,
     perf_stats: RefCell<HashMap<&'static str, KernelStats>>,
+    /// Total GPU execution time (seconds) accumulated across all flushed command buffers.
+    /// Used to compute encode/sync overhead = wall_time - gpu_time.
+    gpu_secs_total: RefCell<f64>,
 }
+
 
 impl MetalBackend {
     pub fn new() -> Self {
@@ -118,6 +122,7 @@ impl MetalBackend {
             "gemm_q4k",
             "gemm_q6k",
             "causal_attention",
+            "argmax_bf16",
         ];
 
         let t0 = std::time::Instant::now();
@@ -148,6 +153,7 @@ impl MetalBackend {
             cmd: RefCell::new(None),
             perf,
             perf_stats: RefCell::new(HashMap::new()),
+            gpu_secs_total: RefCell::new(0.0),
         }
     }
 
@@ -157,6 +163,7 @@ impl MetalBackend {
             s.encoder.endEncoding();
             s.cmd_buf.commit();
             s.cmd_buf.waitUntilCompleted();
+            *self.gpu_secs_total.borrow_mut() += s.cmd_buf.GPUEndTime() - s.cmd_buf.GPUStartTime();
         }
     }
 
@@ -356,6 +363,9 @@ unsafe fn set_f32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: f32, 
 }
 
 impl Backend for MetalBackend {
+    fn gpu_secs_total(&self) -> f64 { *self.gpu_secs_total.borrow() }
+    fn reset_gpu_secs(&self) { *self.gpu_secs_total.borrow_mut() = 0.0; }
+
     fn upload_tensor(&self, tv: &TensorView) -> DeviceBuffer {
         // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
         // means the GPU sees the same memory the CPU loaded the file into.
@@ -663,6 +673,27 @@ impl Backend for MetalBackend {
         });
 
         self.perf_log("add", a.dtype.storage_size(n as usize) * 3, n as usize);
+    }
+
+    fn argmax(&self, logits: &DeviceBuffer) -> u32 {
+        assert!(matches!(logits.dtype, DType::BF16), "argmax expects BF16 logits");
+        let n = logits.n_elements() as u32;
+        let out = self.alloc(&[1], DType::I32);
+        self.encode_groups(
+            "argmax_bf16",
+            sz(1, 1, 1),
+            sz(256, 1, 1),
+            0,
+            |enc| unsafe {
+                set_buf(enc, logits, 0);
+                set_buf(enc, &out, 1);
+                set_u32(enc, n, 2);
+            },
+        );
+        self.flush();
+        let m = out.inner.downcast_ref::<MetalBuffer>().unwrap();
+        let ptr = unsafe { (m.buf.contents().as_ptr() as *const u8).add(m.offset) as *const u32 };
+        unsafe { *ptr }
     }
 
     fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, token_id: u32) {

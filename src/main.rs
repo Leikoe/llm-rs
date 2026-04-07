@@ -76,7 +76,7 @@ fn run_completion(
 
     // Prefill all prompt tokens in one call; logits come back for the last token.
     let start = Instant::now();
-    let mut logits = model.forward(backend, session, &tokens, true).unwrap();
+    model.forward(backend, session, &tokens, true);
 
     let prefill_time = start.elapsed();
     eprintln!(
@@ -87,11 +87,12 @@ fn run_completion(
     );
 
     // Generate
+    backend.reset_gpu_secs();
     let gen_start = Instant::now();
     let mut generated = 0;
 
     loop {
-        let next_token = sampler.sample(&mut logits);
+        let next_token = sampler.sample(backend, session.logits());
 
         if next_token == tokenizer.eos_id
             || tokenizer.eot_id == Some(next_token)
@@ -105,16 +106,21 @@ fn run_completion(
         io::stdout().flush().unwrap();
 
         generated += 1;
-        logits = model.forward(backend, session, &[next_token], true).unwrap();
+        model.forward(backend, session, &[next_token], true);
     }
 
     println!();
     let gen_time = gen_start.elapsed();
+    let wall = gen_time.as_secs_f64();
+    let gpu = backend.gpu_secs_total();
     eprintln!(
-        "Generated: {} tokens in {:.2}s ({:.1} tok/s)",
+        "Generated: {} tokens in {:.2}s ({:.1} tok/s)  [gpu={:.2}s overhead={:.2}s = {:.1}%]",
         generated,
-        gen_time.as_secs_f64(),
-        generated as f64 / gen_time.as_secs_f64()
+        wall,
+        generated as f64 / wall,
+        gpu,
+        wall - gpu,
+        (wall - gpu) / wall * 100.0,
     );
 }
 
@@ -159,11 +165,11 @@ fn run_chat(
         let user_tokens = tokenizer.encode(&user_text);
 
         // Prefill user message in one call; logits come back for the last token.
-        let mut logits = model.forward(backend, session, &user_tokens, true).unwrap();
+        model.forward(backend, session, &user_tokens, true);
 
         // Generate response
         loop {
-            let next_token = sampler.sample(&mut logits);
+            let next_token = sampler.sample(backend, session.logits());
 
             if next_token == tokenizer.eos_id || tokenizer.eot_id == Some(next_token) {
                 break;
@@ -173,7 +179,7 @@ fn run_chat(
             io::stdout().write_all(&piece).unwrap();
             io::stdout().flush().unwrap();
 
-            logits = model.forward(backend, session, &[next_token], true).unwrap();
+            model.forward(backend, session, &[next_token], true);
         }
 
         println!();

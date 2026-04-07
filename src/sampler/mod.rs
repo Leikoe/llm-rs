@@ -44,6 +44,8 @@ impl Default for SamplerConfig {
     }
 }
 
+use crate::backend::{Backend, DeviceBuffer};
+
 pub struct Sampler {
     config: SamplerConfig,
     rng: Rng,
@@ -55,11 +57,18 @@ impl Sampler {
         Sampler { config, rng }
     }
 
-    pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
-        // Greedy
+    /// Sample the next token id from on-device logits. Greedy (temp=0) stays
+    /// fully on device — only 4 bytes come back. Stochastic paths still need
+    /// the full vector CPU-side.
+    pub fn sample(&mut self, backend: &dyn Backend, logits: &DeviceBuffer) -> u32 {
         if self.config.temperature == 0.0 {
-            return argmax(logits);
+            return backend.argmax(logits);
         }
+        let mut logits = backend.read_to_vec_f32(logits);
+        self.sample_cpu(&mut logits)
+    }
+
+    fn sample_cpu(&mut self, logits: &mut [f32]) -> u32 {
 
         // Temperature scaling
         for v in logits.iter_mut() {
@@ -133,14 +142,3 @@ impl Sampler {
     }
 }
 
-fn argmax(data: &[f32]) -> u32 {
-    let mut max_idx = 0;
-    let mut max_val = f32::NEG_INFINITY;
-    for (i, &v) in data.iter().enumerate() {
-        if v > max_val {
-            max_val = v;
-            max_idx = i;
-        }
-    }
-    max_idx as u32
-}
