@@ -290,11 +290,20 @@ kernel void matvec_q4k_simd(
             ddm[6] = dmin * float(insert_bits(uint(s10) >> 4, uint(s6) >> 6, 4u, 2u));
             ddm[7] = dmin * float(insert_bits(uint(s11) >> 4, uint(s7) >> 6, 4u, 2u));
 
+            // Fold the high-nibble shift (packed >> 4) into the odd scales
+            // by premultiplying by 1/16 — the inner loop then uses
+            // `packed & 0xF0` directly, keeping the nibble in place. Deletes
+            // 4 shifts per row per block off the 100%-saturated int pipe.
+            dsc[1] *= (1.0f / 16.0f);
+            dsc[3] *= (1.0f / 16.0f);
+            dsc[5] *= (1.0f / 16.0f);
+            dsc[7] *= (1.0f / 16.0f);
+
             device const uchar* qs = weight + bo + 16;
             for (uint pair = 0; pair < 4; pair++) {
-                uchar packed = qs[pair * 32 + lane];
-                sumf[r] += (dsc[pair*2    ] * float(packed & 0x0F) - ddm[pair*2    ]) * yl[pair*2    ];
-                sumf[r] += (dsc[pair*2 + 1] * float(packed >> 4)   - ddm[pair*2 + 1]) * yl[pair*2 + 1];
+                uint packed = qs[pair * 32 + lane];
+                sumf[r] += (dsc[pair*2    ] * float(packed & 0x0Fu) - ddm[pair*2    ]) * yl[pair*2    ];
+                sumf[r] += (dsc[pair*2 + 1] * float(packed & 0xF0u) - ddm[pair*2 + 1]) * yl[pair*2 + 1];
             }
         }
     }
