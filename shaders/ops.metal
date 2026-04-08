@@ -254,18 +254,47 @@ kernel void matvec_q4k_simd(
             ushort dmin_bits = ushort(weight[bo + 2]) | (ushort(weight[bo + 3]) << 8);
             float d = float(as_type<half>(d_bits));
             float dmin = float(as_type<half>(dmin_bits));
-            device const uchar* scales = weight + bo + 4;
-            device const uchar* qs = weight + bo + 16;
 
-            // Process 4 byte pairs: each byte holds 2 sub-blocks (lo/hi nibble)
+            // Hoist the 12 scale bytes into registers. `device` loads can't
+            // be moved past the pair loop by the compiler (it can't prove no
+            // aliasing), so we do it by hand. Then precompute all 8 scale+min
+            // pairs and premultiply by d / dmin so the inner loop is a single
+            // FMA per nibble.
+            uchar s0 = weight[bo + 4],  s1 = weight[bo + 5],
+                  s2 = weight[bo + 6],  s3 = weight[bo + 7];
+            uchar s4 = weight[bo + 8],  s5 = weight[bo + 9],
+                  s6 = weight[bo + 10], s7 = weight[bo + 11];
+            uchar s8 = weight[bo + 12], s9 = weight[bo + 13],
+                  s10 = weight[bo + 14], s11 = weight[bo + 15];
+
+            // Use extract_bits / insert_bits so the compiler emits the Apple
+            // GPU's bitfield instructions rather than the 4-op (& | << >>)
+            // pattern. Low 4 sub-blocks pack a 6-bit value in the low 6 bits;
+            // upper 4 take 4 low bits from s8..s11 and splice 2 high bits
+            // from s0..s7 at position 4.
+            float dsc[8], ddm[8];
+            dsc[0] = d * float(extract_bits(uint(s0), 0u, 6u));
+            dsc[1] = d * float(extract_bits(uint(s1), 0u, 6u));
+            dsc[2] = d * float(extract_bits(uint(s2), 0u, 6u));
+            dsc[3] = d * float(extract_bits(uint(s3), 0u, 6u));
+            ddm[0] = dmin * float(extract_bits(uint(s4), 0u, 6u));
+            ddm[1] = dmin * float(extract_bits(uint(s5), 0u, 6u));
+            ddm[2] = dmin * float(extract_bits(uint(s6), 0u, 6u));
+            ddm[3] = dmin * float(extract_bits(uint(s7), 0u, 6u));
+            dsc[4] = d * float(insert_bits(uint(s8)  & 0x0Fu, uint(s0) >> 6, 4u, 2u));
+            dsc[5] = d * float(insert_bits(uint(s9)  & 0x0Fu, uint(s1) >> 6, 4u, 2u));
+            dsc[6] = d * float(insert_bits(uint(s10) & 0x0Fu, uint(s2) >> 6, 4u, 2u));
+            dsc[7] = d * float(insert_bits(uint(s11) & 0x0Fu, uint(s3) >> 6, 4u, 2u));
+            ddm[4] = dmin * float(insert_bits(uint(s8)  >> 4, uint(s4) >> 6, 4u, 2u));
+            ddm[5] = dmin * float(insert_bits(uint(s9)  >> 4, uint(s5) >> 6, 4u, 2u));
+            ddm[6] = dmin * float(insert_bits(uint(s10) >> 4, uint(s6) >> 6, 4u, 2u));
+            ddm[7] = dmin * float(insert_bits(uint(s11) >> 4, uint(s7) >> 6, 4u, 2u));
+
+            device const uchar* qs = weight + bo + 16;
             for (uint pair = 0; pair < 4; pair++) {
                 uchar packed = qs[pair * 32 + lane];
-
-                float2 sm_lo = unpack_q4k_scale(scales, pair * 2);
-                float2 sm_hi = unpack_q4k_scale(scales, pair * 2 + 1);
-
-                sumf[r] += (d * sm_lo.x * float(packed & 0x0F) - dmin * sm_lo.y) * yl[pair * 2];
-                sumf[r] += (d * sm_hi.x * float(packed >> 4)   - dmin * sm_hi.y) * yl[pair * 2 + 1];
+                sumf[r] += (dsc[pair*2    ] * float(packed & 0x0F) - ddm[pair*2    ]) * yl[pair*2    ];
+                sumf[r] += (dsc[pair*2 + 1] * float(packed >> 4)   - ddm[pair*2 + 1]) * yl[pair*2 + 1];
             }
         }
     }
@@ -330,6 +359,151 @@ kernel void matvec_q6k_simd(
         if (row >= out_features) break;
         float s = simd_sum(sumf[r]);
         if (lane == 0) output[row] = bfloat(s);
+    }
+}
+
+// ===================== Quantized GEMM =====================
+// Prefill path for Q4_K / Q6_K. Reuses the matvec_qXk tiling (NR rows per
+// simdgroup, NSG simdgroups per TG) and extends it across TILE_S seq columns:
+// each block's dequant work happens once and is MAC'd into NR*TILE_S
+// accumulators. This is where the speedup comes from — quantized matvec is
+// weight-read-bound per dispatch, so amortizing the block fetch across
+// TILE_S queries cuts global memory traffic by ~TILE_S.
+// 2D grid: (ceil(out_features / (NR*NSG)), ceil(seq_len / TILE_S)).
+
+constant constexpr uint QK_GEMM_TS = 8;
+
+kernel void gemm_q4k(
+    device const uchar* weight  [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device bfloat* output       [[buffer(2)]],
+    constant uint& in_features  [[buffer(3)]],
+    constant uint& out_features [[buffer(4)]],
+    constant uint& seq_len      [[buffer(5)]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
+{
+    uint row_base = tgid.x * (Q4K_NR * Q4K_NSG) + sgid * Q4K_NR;
+    uint s_start = tgid.y * QK_GEMM_TS;
+    if (row_base >= out_features || s_start >= seq_len) return;
+    uint tile = min(QK_GEMM_TS, seq_len - s_start);
+
+    uint blocks_per_row = in_features / 256;
+    // Flat accumulators — constant indexing keeps them in registers.
+    float acc[Q4K_NR * QK_GEMM_TS] = {};
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint blk_base = b * 256;
+
+        // Sub-block pair (constant-unrollable). Each pair covers 64 contiguous
+        // input elements at lane-stride 32; load input once per pair and reuse
+        // it across all Q4K_NR weight rows.
+        for (uint pair = 0; pair < 4; pair++) {
+            float y_lo[QK_GEMM_TS];
+            float y_hi[QK_GEMM_TS];
+            uint in_off = blk_base + pair * 64 + lane;
+            for (uint s = 0; s < QK_GEMM_TS; s++) {
+                if (s >= tile) { y_lo[s] = 0.0; y_hi[s] = 0.0; continue; }
+                uint base = (s_start + s) * in_features + in_off;
+                y_lo[s] = float(input[base]);
+                y_hi[s] = float(input[base + 32]);
+            }
+
+            for (uint r = 0; r < Q4K_NR; r++) {
+                uint row = row_base + r;
+                if (row >= out_features) break;
+
+                uint bo = (row * blocks_per_row + b) * 144;
+                ushort d_bits = ushort(weight[bo]) | (ushort(weight[bo + 1]) << 8);
+                ushort dmin_bits = ushort(weight[bo + 2]) | (ushort(weight[bo + 3]) << 8);
+                float d = float(as_type<half>(d_bits));
+                float dmin = float(as_type<half>(dmin_bits));
+                device const uchar* scales = weight + bo + 4;
+                device const uchar* qs = weight + bo + 16;
+
+                uchar packed = qs[pair * 32 + lane];
+                float2 sm_lo = unpack_q4k_scale(scales, pair * 2);
+                float2 sm_hi = unpack_q4k_scale(scales, pair * 2 + 1);
+                float w_lo = d * sm_lo.x * float(packed & 0x0F) - dmin * sm_lo.y;
+                float w_hi = d * sm_hi.x * float(packed >> 4)   - dmin * sm_hi.y;
+
+                for (uint s = 0; s < QK_GEMM_TS; s++)
+                    acc[r * QK_GEMM_TS + s] += w_lo * y_lo[s] + w_hi * y_hi[s];
+            }
+        }
+    }
+
+    for (uint r = 0; r < Q4K_NR; r++) {
+        uint row = row_base + r;
+        if (row >= out_features) break;
+        for (uint s = 0; s < tile; s++) {
+            float t = simd_sum(acc[r * QK_GEMM_TS + s]);
+            if (lane == 0) output[(s_start + s) * out_features + row] = bfloat(t);
+        }
+    }
+}
+
+kernel void gemm_q6k(
+    device const uchar* weight  [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device bfloat* output       [[buffer(2)]],
+    constant uint& in_features  [[buffer(3)]],
+    constant uint& out_features [[buffer(4)]],
+    constant uint& seq_len      [[buffer(5)]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
+{
+    uint row_base = tgid.x * (Q6K_NR * Q6K_NSG) + sgid * Q6K_NR;
+    uint s_start = tgid.y * QK_GEMM_TS;
+    if (row_base >= out_features || s_start >= seq_len) return;
+    uint tile = min(QK_GEMM_TS, seq_len - s_start);
+
+    uint blocks_per_row = in_features / 256;
+    float acc[Q6K_NR * QK_GEMM_TS] = {};
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint blk_base = b * 256;
+
+        // Per sub-k (constant), load input once across tile cols, reuse across rows.
+        for (uint k = 0; k < 8; k++) {
+            float y[QK_GEMM_TS];
+            uint in_off = blk_base + k * 32 + lane;
+            for (uint s = 0; s < QK_GEMM_TS; s++) {
+                if (s >= tile) { y[s] = 0.0; continue; }
+                y[s] = float(input[(s_start + s) * in_features + in_off]);
+            }
+
+            for (uint r = 0; r < Q6K_NR; r++) {
+                uint row = row_base + r;
+                if (row >= out_features) break;
+
+                uint bo = (row * blocks_per_row + b) * 210;
+                device const uchar* ql = weight + bo;
+                device const uchar* qh = weight + bo + 128;
+                device const uchar* scales = weight + bo + 192;
+                ushort d_bits = ushort(weight[bo + 208]) | (ushort(weight[bo + 209]) << 8);
+                float d = float(as_type<half>(d_bits));
+
+                uint elem = k * 32 + lane;
+                float sc = float(as_type<char>(scales[elem / 16]));
+                uchar q = dequant_q6k_elem(ql, qh, elem);
+                float w = d * sc * (float(q) - 32.0);
+
+                for (uint s = 0; s < QK_GEMM_TS; s++)
+                    acc[r * QK_GEMM_TS + s] += w * y[s];
+            }
+        }
+    }
+
+    for (uint r = 0; r < Q6K_NR; r++) {
+        uint row = row_base + r;
+        if (row >= out_features) break;
+        for (uint s = 0; s < tile; s++) {
+            float t = simd_sum(acc[r * QK_GEMM_TS + s]);
+            if (lane == 0) output[(s_start + s) * out_features + row] = bfloat(t);
+        }
     }
 }
 
