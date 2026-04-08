@@ -18,6 +18,9 @@ pub struct ModelConfig {
     pub hidden_dim: usize,
     pub norm_eps: f32,
     pub rope_theta: f32,
+    /// RoPE variant. LLaMA rotates interleaved pairs (x[2i], x[2i+1]);
+    /// Qwen/HF models rotate split pairs (x[i], x[i+head_dim/2]).
+    pub rope_neox: bool,
     pub max_seq_len: usize,
 }
 
@@ -55,6 +58,8 @@ impl ModelConfig {
             .unwrap_or(1e-5);
         let rope_theta = get_f32(metadata, &format!("{arch}.rope.freq_base"))
             .unwrap_or(10000.0);
+        // LLaMA uses interleaved-pair RoPE; Qwen/HF models use split-half (NeoX).
+        let rope_neox = matches!(arch.as_str(), "qwen3" | "qwen2");
         // Cap context to avoid huge KV cache during development.
         let max_seq_len = (get_u32(metadata, &format!("{arch}.context_length"))
             .unwrap_or(4096) as usize)
@@ -62,7 +67,7 @@ impl ModelConfig {
 
         ModelConfig {
             architecture, vocab_size, dim, n_layers, n_heads, n_kv_heads,
-            head_dim, hidden_dim, norm_eps, rope_theta, max_seq_len,
+            head_dim, hidden_dim, norm_eps, rope_theta, rope_neox, max_seq_len,
         }
     }
 }
@@ -223,7 +228,7 @@ impl<B: Backend> Transformer<B> {
                         backend.rms_norm_heads(&mut s.q, qn, cfg.norm_eps);
                         backend.rms_norm_heads(&mut s.k, kn, cfg.norm_eps);
                     }
-                    backend.rope(&mut s.q, &mut s.k, start_pos, cfg.head_dim, cfg.rope_theta);
+                    backend.rope(&mut s.q, &mut s.k, start_pos, cfg.head_dim, cfg.rope_theta, cfg.rope_neox);
 
                     backend.copy_into(&mut kv_cache.k_cache[layer_idx], &s.k, start_pos * kv_dim);
                     backend.copy_into(&mut kv_cache.v_cache[layer_idx], &s.v, start_pos * kv_dim);

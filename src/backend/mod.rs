@@ -44,7 +44,11 @@ pub trait Backend {
 
     /// Apply rotary embeddings to `q` and `k` in place. `start_pos` is the
     /// absolute position of column 0; column `s` gets position `start_pos + s`.
-    fn rope(&self, q: &mut Self::Buffer, k: &mut Self::Buffer, start_pos: usize, head_dim: usize, rope_theta: f32);
+    /// Apply rotary embeddings to `q` and `k` in place. `start_pos` is the
+    /// absolute position of column 0; column `s` gets position `start_pos + s`.
+    /// `neox=false` rotates interleaved pairs `(x[2i], x[2i+1])` (LLaMA);
+    /// `neox=true` rotates split pairs `(x[i], x[i+head_dim/2])` (Qwen/HF).
+    fn rope(&self, q: &mut Self::Buffer, k: &mut Self::Buffer, start_pos: usize, head_dim: usize, rope_theta: f32, neox: bool);
 
     /// Grouped-query attention. `start_pos` is the position of `q`'s first
     /// column. KV cache must already contain entries for positions

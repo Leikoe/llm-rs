@@ -679,6 +679,9 @@ kernel void rms_norm_batch(
 // ===================== Batched RoPE =====================
 // 2D grid: (n_pairs_per_row, seq_len). Each thread handles one rotation pair.
 
+// LLaMA-style rope: rotate interleaved pairs (x[2i], x[2i+1]) within each head.
+// Qwen3/HF-style (NeoX) rope: rotate split pairs (x[i], x[i+head_dim/2]).
+// `neox == 0` picks interleaved, `neox == 1` picks split.
 kernel void rope_batch(
     device bfloat* x           [[buffer(0)]],
     constant uint& start_pos   [[buffer(1)]],
@@ -686,6 +689,7 @@ kernel void rope_batch(
     constant float& theta      [[buffer(3)]],
     constant uint& n_pairs     [[buffer(4)]],
     constant uint& row_stride  [[buffer(5)]],
+    constant uint& neox        [[buffer(6)]],
     uint2 pos [[thread_position_in_grid]])
 {
     uint pair = pos.x, s = pos.y;
@@ -695,17 +699,20 @@ kernel void rope_batch(
     uint half_hd = head_dim / 2;
     uint head = pair / half_hd;
     uint i    = pair % half_hd;
-    uint base = s * row_stride + head * head_dim + 2 * i;
+    uint head_base = s * row_stride + head * head_dim;
+    uint a, b;
+    if (neox != 0) { a = head_base + i;         b = head_base + i + half_hd; }
+    else           { a = head_base + 2 * i;     b = head_base + 2 * i + 1;   }
 
     float freq  = 1.0 / pow(theta, 2.0 * float(i) / float(head_dim));
     float angle = float(p) * freq;
     float cos_a = cos(angle);
     float sin_a = sin(angle);
 
-    float x0 = float(x[base]);
-    float x1 = float(x[base + 1]);
-    x[base]     = bfloat(x0 * cos_a - x1 * sin_a);
-    x[base + 1] = bfloat(x0 * sin_a + x1 * cos_a);
+    float x0 = float(x[a]);
+    float x1 = float(x[b]);
+    x[a] = bfloat(x0 * cos_a - x1 * sin_a);
+    x[b] = bfloat(x0 * sin_a + x1 * cos_a);
 }
 
 // ===================== GEMM =====================

@@ -618,8 +618,10 @@ impl Backend for MetalBackend {
         start_pos: usize,
         head_dim: usize,
         rope_theta: f32,
+        neox: bool,
     ) {
         let seq_len = MetalBuffer::seq_len(q);
+        let neox_flag: u32 = if neox { 1 } else { 0 };
 
         let dispatch = |buf: &mut MetalBuffer| {
             let total = buf.n_elements();
@@ -637,6 +639,7 @@ impl Backend for MetalBackend {
                     set_f32(enc, rope_theta, 3);
                     set_u32(enc, pairs_per_row as u32, 4);
                     set_u32(enc, row_stride as u32, 5);
+                    set_u32(enc, neox_flag, 6);
                 },
             );
         };
