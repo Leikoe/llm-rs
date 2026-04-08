@@ -30,9 +30,44 @@ impl MetalBuffer {
     pub fn seq_len(&self) -> usize {
         if self.shape.len() > 1 { self.shape[1] as usize } else { 1 }
     }
+
 }
 
 const PAGE_SIZE: usize = 16384;
+
+/// Start an Xcode GPU capture to `path`, finalized on `stop_capture`.
+/// Requires `METAL_CAPTURE_ENABLED=1` in the environment at launch so the
+/// Metal framework enables the capture machinery for a non-Xcode binary.
+fn start_capture(device: &ProtocolObject<dyn MTLDevice>, path: &str) {
+    // Clear any stale file so the capture manager doesn't refuse to overwrite.
+    let _ = std::fs::remove_file(path);
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    if !manager.supportsDestination(MTLCaptureDestination::GPUTraceDocument) {
+        eprintln!(
+            "LLM_CAPTURE: GPUTraceDocument destination unsupported. \
+             Launch with METAL_CAPTURE_ENABLED=1."
+        );
+        return;
+    }
+    let desc = MTLCaptureDescriptor::new();
+    let device_obj: &objc2::runtime::AnyObject = device.as_ref();
+    unsafe {
+        desc.setCaptureObject(Some(device_obj));
+        desc.setDestination(MTLCaptureDestination::GPUTraceDocument);
+        desc.setOutputURL(Some(&url));
+    }
+    if let Err(e) = manager.startCaptureWithDescriptor_error(&desc) {
+        eprintln!("LLM_CAPTURE: startCapture failed: {e}");
+        return;
+    }
+    eprintln!("LLM_CAPTURE: recording → {path}");
+}
+
+fn stop_capture() {
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    manager.stopCapture();
+}
 
 /// Load the pre-compiled Metal library (.metallib) embedded at build time.
 /// Falls back to runtime source compilation if the Metal toolchain wasn't available.
@@ -90,6 +125,9 @@ pub struct MetalBackend {
     /// Total GPU execution time (seconds) accumulated across all flushed command buffers.
     /// Used to compute encode/sync overhead = wall_time - gpu_time.
     gpu_secs_total: RefCell<f64>,
+    /// Set iff `LLM_CAPTURE=<path>` was set at init. On Drop we stop the
+    /// capture so the `.gputrace` file is finalized and ready to open in Xcode.
+    capturing: bool,
 }
 
 
@@ -123,6 +161,8 @@ impl MetalBackend {
             "gemm_f32",
             "gemm_bf16",
             "gemm_f16",
+            "gemm_q4k",
+            "gemm_q6k",
             "causal_attention",
             "argmax",
         ];
@@ -148,6 +188,16 @@ impl MetalBackend {
             eprintln!("Metal backend initialized in {pipeline_ms}ms");
         }
 
+        // Optional GPU capture for Xcode's shader profiler. Set
+        //   LLM_CAPTURE=/tmp/foo.gputrace METAL_CAPTURE_ENABLED=1
+        // and every dispatch issued until this backend is dropped is recorded
+        // into the trace file. Open the result in Xcode to get per-line ALU /
+        // memory cost for each kernel.
+        let capturing = match std::env::var("LLM_CAPTURE") {
+            Ok(path) => { start_capture(&device, &path); true }
+            Err(_) => false,
+        };
+
         MetalBackend {
             device,
             queue,
@@ -156,6 +206,7 @@ impl MetalBackend {
             perf,
             perf_stats: RefCell::new(HashMap::new()),
             gpu_secs_total: RefCell::new(0.0),
+            capturing,
         }
     }
 
@@ -448,21 +499,24 @@ impl Backend for MetalBackend {
             return;
         }
 
-        // For quantized types, GEMM is slower than sequential matvec because
-        // quantized weights are tiny (~0.5 bytes/elem for Q4K) so F32 input reads
-        // dominate and weight reuse provides no benefit. Dispatch the optimized
-        // matvec kernel for each sequence position instead.
-        let use_gemm = matches!(weight.dtype, DType::F32 | DType::BF16 | DType::F16);
+        let use_gemm = matches!(
+            weight.dtype,
+            DType::F32 | DType::BF16 | DType::F16 | DType::Q4K | DType::Q6K
+        );
 
         if use_gemm {
             let kernel = match weight.dtype {
                 DType::F32 => "gemm_f32",
                 DType::BF16 => "gemm_bf16",
                 DType::F16 => "gemm_f16",
+                DType::Q4K => "gemm_q4k",
+                DType::Q6K => "gemm_q6k",
                 _ => unreachable!(),
             };
 
-            // BF16 uses MMA kernel (simdgroup_matrix, 32×8 tiles), others scalar (4×4 tiles)
+            // BF16 uses MMA kernel (simdgroup_matrix, 32×8 tiles). Q4K/Q6K reuse
+            // matvec tiling (NR*NSG rows × TILE_S seq columns per TG). F32/F16
+            // use the scalar GEMM (4×4 tiles).
             let (nsg, n_tg_x, n_tg_y): (usize, usize, usize) = match weight.dtype {
                 DType::BF16 => {
                     let nsg = 4usize;
@@ -471,6 +525,15 @@ impl Backend for MetalBackend {
                     (nsg,
                      (out_f as usize + tm - 1) / tm,
                      (seq_len as usize + 7) / 8)
+                }
+                DType::Q4K | DType::Q6K => {
+                    let nsg = 4usize; // Q4K_NSG / Q6K_NSG
+                    let nr = 2usize;  // Q4K_NR / Q6K_NR
+                    let tile_s = 4usize; // QK_GEMM_TS
+                    let rows_per_tg = nr * nsg;
+                    (nsg,
+                     (out_f as usize + rows_per_tg - 1) / rows_per_tg,
+                     (seq_len as usize + tile_s - 1) / tile_s)
                 }
                 _ => {
                     let nsg = 4usize; // GEMM_NSG
@@ -857,7 +920,22 @@ impl Backend for MetalBackend {
     }
 
     fn sync(&self) {
-        self.flush();
+        if self.perf {
+            self.perf_dump();
+        } else {
+            self.flush();
+        }
     }
 }
+
+impl Drop for MetalBackend {
+    fn drop(&mut self) {
+        if self.capturing {
+            self.flush();
+            stop_capture();
+            eprintln!("LLM_CAPTURE: finalized");
+        }
+    }
+}
+
 

@@ -39,6 +39,9 @@ fn compile_metal_shaders() {
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let air_path = format!("{out_dir}/{stem}.air");
 
+        // `-frecord-sources` + `-gline-tables-only` embed the shader source
+        // and line tables into the .metallib so Xcode's GPU frame capture can
+        // show per-source-line counters in the shader profiler.
         let ok = Command::new("xcrun")
             .args([
                 "metal",
@@ -48,6 +51,8 @@ fn compile_metal_shaders() {
                 &air_path,
                 "-std=metal4.0",
                 "-O2",
+                "-frecord-sources",
+                "-gline-tables-only",
             ])
             .status()
             .map(|s| s.success())
