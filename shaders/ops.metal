@@ -423,6 +423,140 @@ kernel void gemm_q4k(
     }
 }
 
+// ===================== Q4K GEMM, multi-stage pipelined =====================
+// Modern tensor-core-style GEMM for Q4K prefill. Splits TG memory into 2
+// stages so the next block's cooperative dequant + bf16→half input convert
+// runs concurrently with the current block's mma. Uses simdgroup_half8x8
+// (which engages the AGX matrix unit, unlike float mma) with a float
+// accumulator for precision on long reductions.
+//
+// Geometry: TM=16 rows × TN=8 cols per TG, NSG=2 simdgroups (one per row tile).
+// TG memory:
+//   dq_stage[2][16 * 256] half  = 16384 B
+//   in_stage[2][256 *  8] half  =  8192 B
+//   acc_stage[16 * 8]    float  =   512 B
+//   total                       ≈ 24.5 KB  (under 32 KB cap)
+
+// Geometry: TM=32 rows × TN=16 cols per TG, NSG=4 (128 lanes/TG). Each SG
+// owns 1 row tile (8 rows) × 2 col tiles (16 cols). simdgroup_half8x8 mma
+// (engages the AGX matrix unit) with simdgroup_float8x8 accumulator for
+// reduction precision. Bf16 input is converted to half during cooperative
+// fill. Empirically the cleanest fast variant on M1 Pro. (Tried 2-stage
+// pipelining via dual TG-mem buffers and via K-half splitting; both added
+// more barrier overhead than they saved in dequant/mma overlap.)
+// TG memory:
+//   dq[32 * 256] half  = 16 KB
+//   in_tile[256 * 16] half =  8 KB
+//   acc_stage[32 * 16] f32 =  2 KB
+//   total ≈ 26 KB (under 32 KB cap)
+constant constexpr uint Q4KP_NSG = 4;
+constant constexpr uint Q4KP_TM  = 32;
+constant constexpr uint Q4KP_TN  = 16;
+
+kernel void gemm_q4k_pipe(
+    device const Q4K_Dev* weight [[buffer(0)]],
+    device const bfloat* input   [[buffer(1)]],
+    device bfloat* output        [[buffer(2)]],
+    constant uint& in_features   [[buffer(3)]],
+    constant uint& out_features  [[buffer(4)]],
+    constant uint& seq_len       [[buffer(5)]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
+{
+    constexpr uint NC = Q4KP_TN / 8;          // 2 col tiles per TG
+    threadgroup half  dq[Q4KP_TM * 256];      // 16 KB
+    threadgroup half  in_tile[256 * Q4KP_TN]; //  8 KB
+    threadgroup float acc_stage[Q4KP_TM * Q4KP_TN]; // 2 KB
+
+    uint m_base = tgid.x * Q4KP_TM;
+    uint n_start = tgid.y * Q4KP_TN;
+    if (m_base >= out_features || n_start >= seq_len) return;
+
+    simdgroup_float8x8 acc[NC];
+    for (uint c = 0; c < NC; c++)
+        acc[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint blocks_per_row = in_features / 256;
+    uint nthreads = Q4KP_NSG * 32;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint k_global_base = b * 256;
+
+        // ---- Cooperative dequant: each SG handles its 8 rows. ----
+        #pragma clang loop unroll(full)
+        for (uint rr = 0; rr < 8; rr++) {
+            uint row_in_tg = sgid * 8 + rr;
+            uint row_global = m_base + row_in_tg;
+            threadgroup half* dst = dq + row_in_tg * 256 + lane;
+            if (row_global >= out_features) {
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 8; k++) dst[k * 32] = 0.0h;
+                continue;
+            }
+            device const Q4K_Dev* blk = weight + (row_global * blocks_per_row + b);
+            uchar4 bb = as_type<uchar4>(blk->qs_t[lane]);
+            half4 ds_lo = ((device const half4*)blk->d_sc)[0];
+            half4 ds_hi = ((device const half4*)blk->d_sc)[1];
+            half4 dm_lo = ((device const half4*)blk->d_m )[0];
+            half4 dm_hi = ((device const half4*)blk->d_m )[1];
+            dst[0 * 32] = half(float(ds_lo.x) * float(bb.x & 0x0Fu) - float(dm_lo.x));
+            dst[1 * 32] = half(float(ds_lo.y) * float(bb.x & 0xF0u) - float(dm_lo.y));
+            dst[2 * 32] = half(float(ds_lo.z) * float(bb.y & 0x0Fu) - float(dm_lo.z));
+            dst[3 * 32] = half(float(ds_lo.w) * float(bb.y & 0xF0u) - float(dm_lo.w));
+            dst[4 * 32] = half(float(ds_hi.x) * float(bb.z & 0x0Fu) - float(dm_hi.x));
+            dst[5 * 32] = half(float(ds_hi.y) * float(bb.z & 0xF0u) - float(dm_hi.y));
+            dst[6 * 32] = half(float(ds_hi.z) * float(bb.w & 0x0Fu) - float(dm_hi.z));
+            dst[7 * 32] = half(float(ds_hi.w) * float(bb.w & 0xF0u) - float(dm_hi.w));
+        }
+
+        // ---- Cooperative bf16 → half input convert. ----
+        uint total = 256 * Q4KP_TN;
+        for (uint i = tid_in_tg; i < total; i += nthreads) {
+            uint ki = i / Q4KP_TN;
+            uint cj = i % Q4KP_TN;
+            uint gs = n_start + cj;
+            half v = 0.0h;
+            if (gs < seq_len) {
+                v = half(float(input[gs * in_features + k_global_base + ki]));
+            }
+            in_tile[ki * Q4KP_TN + cj] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- mma: SG owns 1 row tile (rows sgid*8..+8) × NC col tiles. ----
+        uint row_off = sgid * 8;
+        for (uint kk = 0; kk < 256; kk += 8) {
+            simdgroup_half8x8 A;
+            simdgroup_load(A, dq + row_off * 256 + kk, 256);
+            #pragma clang loop unroll(full)
+            for (uint c = 0; c < NC; c++) {
+                simdgroup_half8x8 B;
+                simdgroup_load(B, in_tile + kk * Q4KP_TN + c * 8, Q4KP_TN);
+                simdgroup_multiply_accumulate(acc[c], A, B, acc[c]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ----- Stage results to TG mem and write out as bf16 with bounds. -----
+    for (uint c = 0; c < NC; c++)
+        simdgroup_store(acc[c], acc_stage + sgid * 8 * Q4KP_TN + c * 8, Q4KP_TN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid_in_tg; idx < Q4KP_TM * Q4KP_TN; idx += nthreads) {
+        uint r = idx / Q4KP_TN;
+        uint s = idx % Q4KP_TN;
+        uint gr = m_base + r;
+        uint gs = n_start + s;
+        if (gr < out_features && gs < seq_len)
+            output[gs * out_features + gr] = bfloat(acc_stage[idx]);
+    }
+}
+
 kernel void gemm_q6k(
     device const uchar* weight  [[buffer(0)]],
     device const bfloat* input  [[buffer(1)]],

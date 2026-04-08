@@ -207,6 +207,7 @@ impl MetalBackend {
             "gemm_bf16",
             "gemm_f16",
             "gemm_q4k",
+            "gemm_q4k_pipe",
             "gemm_q6k",
             "causal_attention",
             "argmax",
@@ -568,10 +569,17 @@ impl Backend for MetalBackend {
         );
 
         if use_gemm {
+            // Q4K has two GEMM kernels with different sweet spots:
+            //  - gemm_q4k: register-tiled, low overhead, best for small seq.
+            //  - gemm_q4k_pipe: simdgroup_matrix-based, larger TG, higher
+            //    fixed overhead but ~15% faster for big prefill (seq≥32).
+            // Crossover empirically lives around seq=16–32 on M1 Pro.
+            let q4k_use_pipe = matches!(weight.dtype, DType::Q4K) && seq_len >= 32;
             let kernel = match weight.dtype {
                 DType::F32 => "gemm_f32",
                 DType::BF16 => "gemm_bf16",
                 DType::F16 => "gemm_f16",
+                DType::Q4K if q4k_use_pipe => "gemm_q4k_pipe",
                 DType::Q4K => "gemm_q4k",
                 DType::Q6K => "gemm_q6k",
                 _ => unreachable!(),
@@ -589,10 +597,29 @@ impl Backend for MetalBackend {
                      (out_f as usize + tm - 1) / tm,
                      (seq_len as usize + 7) / 8)
                 }
-                DType::Q4K | DType::Q6K => {
-                    let nsg = if matches!(weight.dtype, DType::Q4K) { 8 } else { 4 };
-                    let nr  = if matches!(weight.dtype, DType::Q4K) { 4 } else { 2 };
-                    let tile_s = 4usize; // QK_GEMM_TS
+                DType::Q4K if q4k_use_pipe => {
+                    // gemm_q4k_pipe: Q4KP_NSG=4, Q4KP_TM=32, Q4KP_TN=16.
+                    let nsg = 4usize;
+                    let tm = 32usize;
+                    let tn = 16usize;
+                    (nsg,
+                     (out_f as usize + tm - 1) / tm,
+                     (seq_len as usize + tn - 1) / tn)
+                }
+                DType::Q4K => {
+                    // gemm_q4k: NR=4, NSG=8, TILE_S=4 (small-batch path).
+                    let nsg = 8usize;
+                    let nr  = 4usize;
+                    let tile_s = 4usize;
+                    let rows_per_tg = nr * nsg;
+                    (nsg,
+                     (out_f as usize + rows_per_tg - 1) / rows_per_tg,
+                     (seq_len as usize + tile_s - 1) / tile_s)
+                }
+                DType::Q6K => {
+                    let nsg = 4usize;
+                    let nr  = 2usize;
+                    let tile_s = 4usize;
                     let rows_per_tg = nr * nsg;
                     (nsg,
                      (out_f as usize + rows_per_tg - 1) / rows_per_tg,
