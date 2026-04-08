@@ -35,6 +35,51 @@ impl MetalBuffer {
 
 const PAGE_SIZE: usize = 16384;
 
+/// Repack GGUF Q4K (144 B/block) into the device layout (160 B/block):
+/// - 8 half d_sc[k] = d * sc[k], with odd k pre-divided by 16 so the kernel
+///   can use `byte & 0xF0` directly for the high nibble (no shift).
+/// - 8 half d_m [k] = dmin * m[k]
+/// - 32 u32 qs_t[j]: transposed nibble plane. qs_t[j] packs the 8 nibbles
+///   at lane `j` across all 8 sub-blocks into one u32:
+///     byte[p] of qs_t[j] == qs[p*32 + j]   for p in 0..4
+///   i.e. the low nibble of byte[p] is sub-block (2p)'s nibble at lane j,
+///   and the high nibble of byte[p] is sub-block (2p+1)'s nibble at lane j.
+fn repack_q4k(src: &[u8]) -> Vec<u8> {
+    assert!(src.len() % 144 == 0, "Q4K source must be a multiple of 144 B");
+    let n_blocks = src.len() / 144;
+    let mut out = vec![0u8; n_blocks * 160];
+    for (blk_i, blk) in src.chunks_exact(144).enumerate() {
+        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        let dst = &mut out[blk_i * 160..(blk_i + 1) * 160];
+        for k in 0..8 {
+            let (sc, m);
+            if k < 4 {
+                sc = (scales[k] & 63) as u32;
+                m  = (scales[k + 4] & 63) as u32;
+            } else {
+                sc = ((scales[k + 4] & 0x0F) as u32) | (((scales[k - 4] >> 6) as u32) << 4);
+                m  = ((scales[k + 4] >> 4) as u32)   | (((scales[k] >> 6) as u32)     << 4);
+            }
+            let odd_fold = if k & 1 == 1 { 1.0f32 / 16.0 } else { 1.0 };
+            let d_sc = half::f16::from_f32(d * sc as f32 * odd_fold).to_le_bytes();
+            let d_m  = half::f16::from_f32(dmin * m as f32).to_le_bytes();
+            dst[k * 2..k * 2 + 2].copy_from_slice(&d_sc);
+            dst[16 + k * 2..16 + k * 2 + 2].copy_from_slice(&d_m);
+        }
+        for j in 0..32 {
+            let v: u32 = (qs[j] as u32)
+                | ((qs[32 + j] as u32) << 8)
+                | ((qs[64 + j] as u32) << 16)
+                | ((qs[96 + j] as u32) << 24);
+            dst[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Start an Xcode GPU capture to `path`, finalized on `stop_capture`.
 /// Requires `METAL_CAPTURE_ENABLED=1` in the environment at launch so the
 /// Metal framework enables the capture machinery for a non-Xcode binary.
@@ -421,6 +466,23 @@ impl Backend for MetalBackend {
     fn reset_gpu_secs(&self) { *self.gpu_secs_total.borrow_mut() = 0.0; }
 
     fn upload_tensor(&self, tv: &TensorView) -> MetalBuffer {
+        // Q4K: repack into the device layout (160 B/block) with scales and
+        // mins pre-multiplied by d/dmin, and the nibble plane transposed so
+        // one u32 load gives each lane its 8 sub-block nibbles. Costs 11%
+        // more VRAM than the on-disk 144 B/block layout; gains 2× kernel BW.
+        if tv.dtype == DType::Q4K {
+            let repacked = repack_q4k(tv.data);
+            let buf = self
+                .device
+                .newBufferWithLength_options(repacked.len(), MTLResourceOptions::StorageModeShared)
+                .expect("Failed to alloc Q4K repack buffer");
+            unsafe {
+                let dst = buf.contents().as_ptr() as *mut u8;
+                std::ptr::copy_nonoverlapping(repacked.as_ptr(), dst, repacked.len());
+            }
+            return MetalBuffer { buf, offset: 0, dtype: tv.dtype, shape: tv.shape.clone() };
+        }
+
         // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
         // means the GPU sees the same memory the CPU loaded the file into.
         // Metal requires the pointer to be page-aligned and the length to be a page
@@ -472,7 +534,8 @@ impl Backend for MetalBackend {
                 _ => unimplemented!("matvec for {:?}", weight.dtype),
             };
             let (nr, nsg) = match weight.dtype {
-                DType::Q4K | DType::Q6K => (2, 4),
+                DType::Q4K => (4, 8),
+                DType::Q6K => (2, 4),
                 DType::BF16 | DType::F16 => (2, 4),
                 _ => (1, 8),
             };
@@ -527,8 +590,8 @@ impl Backend for MetalBackend {
                      (seq_len as usize + 7) / 8)
                 }
                 DType::Q4K | DType::Q6K => {
-                    let nsg = 4usize; // Q4K_NSG / Q6K_NSG
-                    let nr = 2usize;  // Q4K_NR / Q6K_NR
+                    let nsg = if matches!(weight.dtype, DType::Q4K) { 8 } else { 4 };
+                    let nr  = if matches!(weight.dtype, DType::Q4K) { 4 } else { 2 };
                     let tile_s = 4usize; // QK_GEMM_TS
                     let rows_per_tg = nr * nsg;
                     (nsg,
@@ -577,7 +640,8 @@ impl Backend for MetalBackend {
                 _ => unimplemented!("matmul for {:?}", weight.dtype),
             };
             let (nr, nsg) = match weight.dtype {
-                DType::Q4K | DType::Q6K => (2, 4),
+                DType::Q4K => (4, 8),
+                DType::Q6K => (2, 4),
                 _ => (1, 8),
             };
             let rows_per_tg = nr * nsg;
