@@ -6,10 +6,10 @@ mod qwen3;
 
 use crate::backend::Backend;
 use crate::gguf::GgufFile;
-use crate::model::{ModelConfig, Transformer};
+use crate::model::{ConfigError, ModelConfig, Transformer};
 
-pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Transformer<B> {
-    let config = ModelConfig::from_gguf_metadata(&gguf.metadata);
+pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Result<Transformer<B>, ConfigError> {
+    let config = ModelConfig::from_gguf_metadata(&gguf.metadata)?;
 
     eprintln!(
         "{} model: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
@@ -22,8 +22,8 @@ pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Transformer<B> {
 
     let model = match config.architecture.as_str() {
         "llama" => llama::build(&mut loader, config),
-        "qwen3" | "qwen35" => qwen3::build(&mut loader, config),
-        other => panic!("unsupported architecture: {other}"),
+        "qwen3" => qwen3::build(&mut loader, config),
+        other => return Err(ConfigError::unsupported_arch(other)),
     };
 
     let elapsed = upload_start.elapsed().as_secs_f64();
@@ -33,7 +33,7 @@ pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Transformer<B> {
         gb, elapsed, gb / elapsed,
     );
 
-    model
+    Ok(model)
 }
 
 /// Tensor upload helper. Not generic over architecture — every recipe

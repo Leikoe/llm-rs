@@ -13,20 +13,25 @@ use llm_rs::sampler::{Sampler, SamplerConfig};
 
 use llm_rs::tokenizer::Tokenizer;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run_main() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let gguf = GgufFile::open(&cli.model)?;
     let tokenizer = Tokenizer::from_gguf_metadata(&gguf.metadata);
 
-    // One match-and-dispatch at startup. Future backends slot in here.
     let backend = MetalBackend::new();
-    run(&backend, &gguf, &tokenizer, cli);
-    Ok(())
+    run(&backend, &gguf, &tokenizer, cli)
 }
 
-fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli) {
-    let model = arch::load(gguf, backend);
+fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let model = arch::load(gguf, backend)?;
 
     match cli.command {
         Command::Complete {
@@ -57,6 +62,7 @@ fn run<B: Backend>(backend: &B, gguf: &GgufFile, tokenizer: &Tokenizer, cli: Cli
             );
         }
     }
+    Ok(())
 }
 
 fn run_completion<B: Backend>(

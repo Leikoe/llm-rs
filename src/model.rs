@@ -1,9 +1,27 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::backend::Backend;
 use crate::gguf::metadata::MetadataValue;
 use crate::kv_cache::KVCache;
 use crate::tensor::DType;
+
+#[derive(Debug)]
+pub struct ConfigError(String);
+
+impl ConfigError {
+    pub fn unsupported_arch(arch: &str) -> Self {
+        ConfigError(format!("unsupported architecture: {arch}"))
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// RoPE pair-selection strategy.
 #[derive(Debug, Clone, Copy)]
@@ -32,45 +50,42 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    pub fn from_gguf_metadata(metadata: &HashMap<String, MetadataValue>) -> Self {
+    pub fn from_gguf_metadata(metadata: &HashMap<String, MetadataValue>) -> Result<Self, ConfigError> {
+        let require = |key: &str| -> Result<u32, ConfigError> {
+            get_u32(metadata, key).ok_or_else(|| ConfigError(format!("missing metadata key: {key}")))
+        };
+
         let architecture = metadata
             .get("general.architecture")
             .and_then(|v| v.as_str())
-            .unwrap_or("llama")
+            .ok_or_else(|| ConfigError("missing general.architecture".into()))?
             .to_string();
         let arch = &architecture;
 
-        // GGUF doesn't store vocab_size directly; derive it from the token table length.
         let vocab_size = metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.as_string_array())
-            .expect("missing tokenizer.ggml.tokens")
+            .ok_or_else(|| ConfigError("missing tokenizer.ggml.tokens".into()))?
             .len();
 
-        let dim = get_u32(metadata, &format!("{arch}.embedding_length"))
-            .expect("missing embedding_length") as usize;
-        let n_layers = get_u32(metadata, &format!("{arch}.block_count"))
-            .expect("missing block_count") as usize;
-        let n_heads = get_u32(metadata, &format!("{arch}.attention.head_count"))
-            .expect("missing head_count") as usize;
+        let dim = require(&format!("{arch}.embedding_length"))? as usize;
+        let n_layers = require(&format!("{arch}.block_count"))? as usize;
+        let n_heads = require(&format!("{arch}.attention.head_count"))? as usize;
         let n_kv_heads = get_u32(metadata, &format!("{arch}.attention.head_count_kv"))
             .unwrap_or(n_heads as u32) as usize;
-        // Qwen3 stores head_dim explicitly (key_length); LLaMA derives it from dim/n_heads.
         let head_dim = get_u32(metadata, &format!("{arch}.attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(dim / n_heads);
-        let hidden_dim = get_u32(metadata, &format!("{arch}.feed_forward_length"))
-            .expect("missing feed_forward_length") as usize;
+        let hidden_dim = require(&format!("{arch}.feed_forward_length"))? as usize;
         let norm_eps = get_f32(metadata, &format!("{arch}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
         let rope_theta = get_f32(metadata, &format!("{arch}.rope.freq_base"))
             .unwrap_or(10000.0);
-        let rope_layout = if matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen2") {
+        let rope_layout = if matches!(arch.as_str(), "qwen3" | "qwen2") {
             RopeLayout::SplitHalf
         } else {
             RopeLayout::Interleaved
         };
-        // Cap context to avoid huge KV cache during development.
         let model_ctx = get_u32(metadata, &format!("{arch}.context_length"))
             .unwrap_or(4096) as usize;
         let max_seq_len = model_ctx.min(4096);
@@ -78,10 +93,10 @@ impl ModelConfig {
             eprintln!("Note: model context length {model_ctx} capped to {max_seq_len}");
         }
 
-        ModelConfig {
+        Ok(ModelConfig {
             architecture, vocab_size, dim, n_layers, n_heads, n_kv_heads,
             head_dim, hidden_dim, norm_eps, rope_theta, rope_layout, max_seq_len,
-        }
+        })
     }
 }
 
