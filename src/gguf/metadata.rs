@@ -41,14 +41,18 @@ impl MetadataValue {
 
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            MetadataValue::U32(v) => Some(*v),
+            MetadataValue::U32(n) => Some(*n),
+            MetadataValue::I32(n) => Some(*n as u32),
+            MetadataValue::U64(n) => Some(*n as u32),
+            MetadataValue::I64(n) => Some(*n as u32),
             _ => None,
         }
     }
 
     pub fn as_f32(&self) -> Option<f32> {
         match self {
-            MetadataValue::F32(v) => Some(*v),
+            MetadataValue::F32(n) => Some(*n),
+            MetadataValue::F64(n) => Some(*n as f32),
             _ => None,
         }
     }

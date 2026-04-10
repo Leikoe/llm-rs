@@ -129,6 +129,15 @@ impl DType {
     }
 }
 
+/// RoPE pair-selection strategy.
+#[derive(Debug, Clone, Copy)]
+pub enum RopeLayout {
+    /// LLaMA: rotate `(x[2i], x[2i+1])`.
+    Interleaved,
+    /// Qwen/HF: rotate `(x[i], x[i+head_dim/2])`.
+    SplitHalf,
+}
+
 #[derive(Debug)]
 pub struct TensorView<'a> {
     pub name: &'a str,

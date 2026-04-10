@@ -1,52 +1,52 @@
-//! Per-architecture loaders. Each module is a declarative recipe that
-//! reads tensors from a GGUF file and assembles a `Transformer<B>`.
+//! Per-architecture model loaders. Each module defines a concrete model type
+//! that implements `Model<B>`.
 
-mod llama;
-mod qwen3;
+pub mod llama;
+pub mod qwen3;
+
+use std::fmt;
 
 use crate::backend::Backend;
 use crate::gguf::GgufFile;
-use crate::model::{ConfigError, ModelConfig, Transformer};
 
-pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Result<Transformer<B>, ConfigError> {
-    let config = ModelConfig::from_gguf_metadata(&gguf.metadata)?;
+#[derive(Debug)]
+pub struct LoadError(String);
 
-    eprintln!(
-        "{} model: dim={}, layers={}, heads={}, kv_heads={}, vocab={}",
-        config.architecture,
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size,
-    );
-
-    let upload_start = std::time::Instant::now();
-    let mut loader = Loader::new(gguf, backend);
-
-    let model = match config.architecture.as_str() {
-        "llama" => llama::build(&mut loader, config),
-        "qwen3" => qwen3::build(&mut loader, config),
-        other => return Err(ConfigError::unsupported_arch(other)),
-    };
-
-    let elapsed = upload_start.elapsed().as_secs_f64();
-    let gb = loader.bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    eprintln!(
-        "Uploaded model weights to backend: {:.2} GB in {:.3}s ({:.1} GB/s)",
-        gb, elapsed, gb / elapsed,
-    );
-
-    Ok(model)
+impl LoadError {
+    pub fn missing(key: &str) -> Self {
+        LoadError(format!("missing metadata key: {key}"))
+    }
+    pub fn unsupported_arch(arch: &str) -> Self {
+        LoadError(format!("unsupported architecture: {arch}"))
+    }
 }
 
-/// Tensor upload helper. Not generic over architecture — every recipe
-/// pulls weights through the same two methods.
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Read the architecture string from GGUF metadata.
+pub fn arch_name(gguf: &GgufFile) -> Result<&str, LoadError> {
+    gguf.metadata.get("general.architecture")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LoadError::missing("general.architecture"))
+}
+
+/// Tensor upload helper used by all architecture loaders.
 pub struct Loader<'a, B: Backend> {
     gguf: &'a GgufFile,
     backend: &'a B,
     bytes: usize,
+    start: std::time::Instant,
 }
 
 impl<'a, B: Backend> Loader<'a, B> {
-    fn new(gguf: &'a GgufFile, backend: &'a B) -> Self {
-        Loader { gguf, backend, bytes: 0 }
+    pub fn new(gguf: &'a GgufFile, backend: &'a B) -> Self {
+        Loader { gguf, backend, bytes: 0, start: std::time::Instant::now() }
     }
 
     pub fn opt(&mut self, name: &str) -> Option<B::Buffer> {
@@ -58,5 +58,11 @@ impl<'a, B: Backend> Loader<'a, B> {
 
     pub fn req(&mut self, name: &str) -> B::Buffer {
         self.opt(name).unwrap_or_else(|| panic!("missing tensor: {name}"))
+    }
+
+    pub fn print_stats(&self) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let gb = self.bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!("Uploaded model weights: {gb:.2} GB in {elapsed:.3}s ({:.1} GB/s)", gb / elapsed);
     }
 }

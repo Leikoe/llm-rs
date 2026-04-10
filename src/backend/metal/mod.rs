@@ -8,8 +8,7 @@ use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 
 use crate::backend::Backend;
-use crate::model::RopeLayout;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, RopeLayout, TensorView};
 
 pub struct MetalBuffer {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,

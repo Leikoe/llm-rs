@@ -1,7 +1,6 @@
 pub mod metal;
 
-use crate::model::RopeLayout;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, RopeLayout, TensorView};
 
 /// The set of primitive ops a transformer forward pass needs.
 ///
