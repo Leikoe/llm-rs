@@ -2,8 +2,9 @@
 
 use crate::arch::{LoadError, Loader};
 use crate::backend::Backend;
+use crate::batch::Batch;
 use crate::gguf::GgufFile;
-use crate::kv_cache::KVCache;
+use crate::kv_pool::PagedKVPool;
 use crate::model::Model;
 use crate::tensor::{DType, RopeLayout};
 
@@ -17,7 +18,6 @@ struct Config {
     hidden_dim: usize,
     norm_eps: f32,
     rope_theta: f32,
-    max_seq_len: usize,
 }
 
 pub struct Qwen3Model<B: Backend> {
@@ -26,6 +26,7 @@ pub struct Qwen3Model<B: Backend> {
     output_norm: B::Buffer,
     output_weight: B::Buffer,
     layers: Vec<Layer<B>>,
+    logits_buf: B::Buffer,
 }
 
 struct Layer<B: Backend> {
@@ -42,13 +43,6 @@ struct Layer<B: Backend> {
     w3: B::Buffer,
 }
 
-pub struct Session<B: Backend> {
-    kv_cache: KVCache<B>,
-    pos: usize,
-    logits: B::Buffer,
-    decode: Scratch<B>,
-}
-
 struct Scratch<B: Backend> {
     x: B::Buffer, x_norm: B::Buffer,
     q: B::Buffer, k: B::Buffer, v: B::Buffer,
@@ -56,14 +50,17 @@ struct Scratch<B: Backend> {
     x2: B::Buffer,
     gate: B::Buffer, up: B::Buffer, gate_up: B::Buffer,
     ffn_out: B::Buffer,
+    last_x: B::Buffer, last_x_norm: B::Buffer,
 }
 
 impl<B: Backend> Scratch<B> {
-    fn new(backend: &B, c: &Config, seq_len: usize) -> Self {
+    fn new(backend: &B, c: &Config, n: usize, num_requests: usize) -> Self {
         let (d, q, kv, h) = (c.dim as u64, (c.n_heads * c.head_dim) as u64,
             (c.n_kv_heads * c.head_dim) as u64, c.hidden_dim as u64);
-        let n = seq_len as u64;
-        let s = |base: u64| -> Vec<u64> { if seq_len == 1 { vec![base] } else { vec![base, n] } };
+        let n = n as u64;
+        let s = |base: u64| -> Vec<u64> { if n == 1 { vec![base] } else { vec![base, n] } };
+        let r = num_requests as u64;
+        let rs = |base: u64| -> Vec<u64> { if r == 1 { vec![base] } else { vec![base, r] } };
         Scratch {
             x: backend.alloc(&s(d), DType::BF16), x_norm: backend.alloc(&s(d), DType::BF16),
             q: backend.alloc(&s(q), DType::BF16), k: backend.alloc(&s(kv), DType::BF16),
@@ -71,6 +68,7 @@ impl<B: Backend> Scratch<B> {
             wo_out: backend.alloc(&s(d), DType::BF16), x2: backend.alloc(&s(d), DType::BF16),
             gate: backend.alloc(&s(h), DType::BF16), up: backend.alloc(&s(h), DType::BF16),
             gate_up: backend.alloc(&s(h), DType::BF16), ffn_out: backend.alloc(&s(d), DType::BF16),
+            last_x: backend.alloc(&rs(d), DType::BF16), last_x_norm: backend.alloc(&rs(d), DType::BF16),
         }
     }
 }
@@ -104,8 +102,9 @@ impl<B: Backend> Qwen3Model<B> {
             })
             .collect();
 
+        let logits_buf = backend.alloc(&[config.vocab_size as u64], DType::BF16);
         l.print_stats();
-        Ok(Qwen3Model { config, token_embedding, output_norm, output_weight, layers })
+        Ok(Qwen3Model { config, token_embedding, output_norm, output_weight, layers, logits_buf })
     }
 
     fn parse_config(gguf: &GgufFile) -> Result<Config, LoadError> {
@@ -127,64 +126,18 @@ impl<B: Backend> Qwen3Model<B> {
         let hidden_dim = req("qwen3.feed_forward_length")? as usize;
         let norm_eps = get_f32("qwen3.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_theta = get_f32("qwen3.rope.freq_base").unwrap_or(10000.0);
-        let model_ctx = get_u32("qwen3.context_length").unwrap_or(4096) as usize;
-        let max_seq_len = model_ctx.min(4096);
-        if model_ctx > max_seq_len {
-            eprintln!("Note: model context {model_ctx} capped to {max_seq_len}");
-        }
 
-        Ok(Config { vocab_size, dim, n_layers, n_heads, n_kv_heads, head_dim, hidden_dim, norm_eps, rope_theta, max_seq_len })
+        Ok(Config { vocab_size, dim, n_layers, n_heads, n_kv_heads, head_dim, hidden_dim, norm_eps, rope_theta })
     }
 }
 
 impl<B: Backend> Model<B> for Qwen3Model<B> {
-    type Session = Session<B>;
-
-    fn new_session(&self, backend: &B) -> Session<B> {
+    fn forward(&mut self, backend: &B, pool: &mut PagedKVPool<B>, batch: &Batch<B>) {
         let c = &self.config;
         let kv_dim = c.n_kv_heads * c.head_dim;
-        Session {
-            kv_cache: KVCache::new(backend, c.n_layers, kv_dim, c.max_seq_len),
-            pos: 0,
-            logits: backend.alloc(&[c.vocab_size as u64], DType::BF16),
-            decode: Scratch::new(backend, c, 1),
-        }
-    }
+        let mut s = Scratch::new(backend, c, batch.num_tokens, batch.num_requests);
 
-    fn logits<'a>(&self, session: &'a Session<B>) -> &'a B::Buffer { &session.logits }
-
-    fn forward(&self, backend: &B, session: &mut Session<B>, tokens: &[u32], want_logits: bool) {
-        if tokens.is_empty() { return; }
-        let c = &self.config;
-        let kv_dim = c.n_kv_heads * c.head_dim;
-        let start_pos = session.pos;
-
-        let (batch, tail) = if want_logits {
-            (&tokens[..tokens.len() - 1], Some(tokens[tokens.len() - 1]))
-        } else {
-            (tokens, None)
-        };
-        if !batch.is_empty() {
-            let mut s = Scratch::new(backend, c, batch.len());
-            self.run_layers(backend, &mut s, &mut session.kv_cache, batch, start_pos, kv_dim);
-        }
-        session.pos = start_pos + tokens.len();
-        let Some(tail_token) = tail else { return };
-        let s = &mut session.decode;
-        self.run_layers(backend, s, &mut session.kv_cache,
-            std::slice::from_ref(&tail_token), start_pos + batch.len(), kv_dim);
-        backend.rms_norm(&mut s.x_norm, &s.x, &self.output_norm, c.norm_eps);
-        backend.matmul(&mut session.logits, &self.output_weight, &s.x_norm);
-    }
-}
-
-impl<B: Backend> Qwen3Model<B> {
-    fn run_layers(
-        &self, backend: &B, s: &mut Scratch<B>, kv_cache: &mut KVCache<B>,
-        tokens: &[u32], start_pos: usize, kv_dim: usize,
-    ) {
-        let c = &self.config;
-        backend.embed(&mut s.x, &self.token_embedding, tokens);
+        backend.embed(&mut s.x, &self.token_embedding, &batch.tokens);
         for (i, layer) in self.layers.iter().enumerate() {
             backend.rms_norm(&mut s.x_norm, &s.x, &layer.attn_norm, c.norm_eps);
             backend.matmul(&mut s.q, &layer.wq, &s.x_norm);
@@ -192,11 +145,14 @@ impl<B: Backend> Qwen3Model<B> {
             backend.matmul(&mut s.v, &layer.wv, &s.x_norm);
             backend.rms_norm_heads(&mut s.q, &layer.q_norm, c.norm_eps);
             backend.rms_norm_heads(&mut s.k, &layer.k_norm, c.norm_eps);
-            backend.rope(&mut s.q, &mut s.k, start_pos, c.head_dim, c.rope_theta, RopeLayout::SplitHalf);
-            backend.copy_into(&mut kv_cache.k_cache[i], &s.k, start_pos * kv_dim);
-            backend.copy_into(&mut kv_cache.v_cache[i], &s.v, start_pos * kv_dim);
-            backend.attention(&mut s.attn_out, &s.q, &kv_cache.k_cache[i], &kv_cache.v_cache[i],
-                start_pos, c.n_heads, c.n_kv_heads, c.head_dim);
+            backend.rope(&mut s.q, &mut s.k, &batch.positions, c.head_dim, c.rope_theta, RopeLayout::SplitHalf);
+            backend.scatter_kv(&mut pool.k[i], &s.k, &batch.slot_mapping, kv_dim, batch.num_tokens);
+            backend.scatter_kv(&mut pool.v[i], &s.v, &batch.slot_mapping, kv_dim, batch.num_tokens);
+            backend.attention(
+                &mut s.attn_out, &s.q, &pool.k[i], &pool.v[i],
+                &batch.block_tables, &batch.query_starts, &batch.seq_lens,
+                c.n_heads, c.n_kv_heads, c.head_dim, pool.block_size, batch.max_blocks_per_seq,
+            );
             backend.matmul(&mut s.wo_out, &layer.wo, &s.attn_out);
             backend.add(&mut s.x2, &s.x, &s.wo_out);
             backend.rms_norm(&mut s.x_norm, &s.x2, &layer.ffn_norm, c.norm_eps);
@@ -207,5 +163,12 @@ impl<B: Backend> Qwen3Model<B> {
             backend.matmul(&mut s.ffn_out, &layer.w2, &s.gate_up);
             backend.add(&mut s.x, &s.x2, &s.ffn_out);
         }
+
+        backend.gather(&mut s.last_x, &s.x, &batch.logit_indices, batch.num_requests);
+        backend.rms_norm(&mut s.last_x_norm, &s.last_x, &self.output_norm, c.norm_eps);
+        self.logits_buf = backend.alloc(&[c.vocab_size as u64, batch.num_requests as u64], DType::BF16);
+        backend.matmul(&mut self.logits_buf, &self.output_weight, &s.last_x_norm);
     }
+
+    fn logits(&self) -> &B::Buffer { &self.logits_buf }
 }

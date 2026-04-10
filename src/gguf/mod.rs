@@ -221,6 +221,10 @@ impl GgufFile {
         (self.data.base_ptr(), self.data.mmap_len())
     }
 
+    pub fn file_size(&self) -> usize {
+        self.data.as_slice().len()
+    }
+
     fn tensor_name(&self, info: &TensorInfo) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.data.as_slice()[info.name_start..info.name_start + info.name_len]) }
     }

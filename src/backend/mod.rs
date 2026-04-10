@@ -42,34 +42,40 @@ pub trait Backend {
     /// across all heads.
     fn rms_norm_heads(&self, x: &mut Self::Buffer, weight: &Self::Buffer, eps: f32);
 
-    /// Apply rotary embeddings to `q` and `k` in place. `start_pos` is the
-    /// absolute position of column 0; column `s` gets position `start_pos + s`.
-    /// `layout` controls pair selection: `Interleaved` rotates `(x[2i], x[2i+1])`
-    /// (LLaMA); `SplitHalf` rotates `(x[i], x[i+head_dim/2])` (Qwen/HF).
-    fn rope(&self, q: &mut Self::Buffer, k: &mut Self::Buffer, start_pos: usize, head_dim: usize, rope_theta: f32, layout: RopeLayout);
+    /// Apply rotary embeddings to `q` and `k` in place. `positions` is a u32
+    /// buffer giving the absolute position for each column.
+    fn rope(&self, q: &mut Self::Buffer, k: &mut Self::Buffer, positions: &Self::Buffer, head_dim: usize, rope_theta: f32, layout: RopeLayout);
 
-    /// Grouped-query attention. `start_pos` is the position of `q`'s first
-    /// column. KV cache must already contain entries for positions
-    /// `0..start_pos + seq_len`.
+    /// Paged varlen grouped-query attention. Handles any mix of decode (1 token)
+    /// and prefill (N tokens) requests in one dispatch.
     fn attention(
         &self,
         out: &mut Self::Buffer,
         q: &Self::Buffer,
-        k_cache: &Self::Buffer,
-        v_cache: &Self::Buffer,
-        start_pos: usize,
+        k_pool: &Self::Buffer,
+        v_pool: &Self::Buffer,
+        block_table: &Self::Buffer,
+        query_starts: &Self::Buffer,
+        seq_lens: &Self::Buffer,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
     );
+
+    /// Write K/V vectors to paged pool slots via slot_mapping.
+    fn scatter_kv(&self, pool: &mut Self::Buffer, src: &Self::Buffer, slot_mapping: &Self::Buffer, kv_dim: usize, num_tokens: usize);
+
+    /// Gather columns from `src` at `indices` into `out`.
+    fn gather(&self, out: &mut Self::Buffer, src: &Self::Buffer, indices: &Self::Buffer, num_indices: usize);
+
+    /// Upload a small u32 array to a GPU buffer.
+    fn upload_u32(&self, data: &[u32]) -> Self::Buffer;
 
     fn silu(&self, x: &mut Self::Buffer);
     fn mul(&self, out: &mut Self::Buffer, a: &Self::Buffer, b: &Self::Buffer);
     fn add(&self, out: &mut Self::Buffer, a: &Self::Buffer, b: &Self::Buffer);
-
-    /// Copy `src` into `dst` starting at `dst_offset_elements`. Used to fold
-    /// freshly-computed K/V vectors into the KV cache.
-    fn copy_into(&self, dst: &mut Self::Buffer, src: &Self::Buffer, dst_offset_elements: usize);
 
     fn read_to_vec_f32(&self, buf: &Self::Buffer) -> Vec<f32>;
 

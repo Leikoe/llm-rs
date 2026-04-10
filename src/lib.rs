@@ -1,9 +1,11 @@
 pub mod arch;
 pub mod backend;
+pub mod batch;
 pub mod cli;
 pub mod gguf;
-pub mod kv_cache;
+pub mod kv_pool;
 pub mod model;
 pub mod sampler;
+pub mod serve;
 pub mod tensor;
 pub mod tokenizer;

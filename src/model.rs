@@ -1,9 +1,8 @@
 use crate::backend::Backend;
+use crate::batch::Batch;
+use crate::kv_pool::PagedKVPool;
 
-/// A loaded model that can run forward passes.
 pub trait Model<B: Backend> {
-    type Session;
-    fn new_session(&self, backend: &B) -> Self::Session;
-    fn forward(&self, backend: &B, session: &mut Self::Session, tokens: &[u32], want_logits: bool);
-    fn logits<'a>(&self, session: &'a Self::Session) -> &'a B::Buffer;
+    fn forward(&mut self, backend: &B, pool: &mut PagedKVPool<B>, batch: &Batch<B>);
+    fn logits(&self) -> &B::Buffer;
 }

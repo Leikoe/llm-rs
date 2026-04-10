@@ -37,6 +37,12 @@ pub enum Command {
         #[command(flatten)]
         sampling: SamplingArgs,
     },
+    /// Start OpenAI-compatible HTTP server
+    Serve {
+        /// Port to listen on
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 #[derive(clap::Args)]

@@ -38,9 +38,9 @@ back on growth that doesn't pay for itself.
 
 | Metric                       | Current | Soft cap |
 |------------------------------|---------|----------|
-| Rust LOC (`src/**/*.rs`)     |   2712  |   6000   |
-| Metal LOC (`shaders/*.metal`)|   1130  |   3000   |
-| Non-Apple deps (Cargo.toml)  |     3   |     5    |
+| Rust LOC (`src/**/*.rs`)     |   3553  |   8000   |
+| Metal LOC (`shaders/*.metal`)|   1180  |   3000   |
+| Non-Apple deps (Cargo.toml)  |     8   |    10    |
 
 When you cross a soft cap, stop and ask whether the new code is paying for
 its weight. Deletion is a feature. If a roadmap item ships with a net
@@ -66,8 +66,10 @@ find shaders -name '*.metal' | xargs wc -l | tail -1
 - `src/tensor/` -- DType enum, TensorView (borrows from GgufFile buffer)
 - `src/backend/` -- Backend trait (~12 ops), CPU impl, Metal impl
 - `src/model/` -- ModelConfig, LLaMA forward pass with GQA
-- `src/kv_cache/` -- Per-layer KV cache, flat [max_seq_len, kv_dim] buffers
+- `src/kv_pool.rs` -- Paged KV block pool with free list, block allocation
+- `src/batch.rs` -- Batch struct: tokens, positions, block tables, slot mapping for one forward step
 - `src/sampler/` -- Temperature, top-k, top-p, custom xorshift64 PRNG
+- `src/serve/` -- HTTP serving: engine loop (batched forward), scheduler (unified token budget), OpenAI-compatible API
 - `src/cli/` -- Clap-based CLI: `complete` and `chat` subcommands
 - `shaders/` -- Metal compute shaders (ops.metal: embed, matvec, SIMD matvec with multi-row+register caching, rms_norm, rope, softmax, silu, elementwise, flash attention)
 - `build.rs` -- AOT Metal shader compilation (.metal -> .air -> .metallib via xcrun metal4.0, embedded in binary)
@@ -98,13 +100,16 @@ pub trait Backend {
     fn embed(&self, out: &mut DeviceBuffer, table: &DeviceBuffer, tokens: &[u32]);
     fn matmul(&self, out: &mut DeviceBuffer, weight: &DeviceBuffer, input: &DeviceBuffer);
     fn rms_norm(&self, out: &mut DeviceBuffer, input: &DeviceBuffer, weight: &DeviceBuffer, eps: f32);
-    fn rope(&self, q: &mut DeviceBuffer, k: &mut DeviceBuffer, start_pos: usize, head_dim: usize, theta: f32);
-    fn attention(&self, out: &mut DeviceBuffer, q: &DeviceBuffer, k_cache: &DeviceBuffer, v_cache: &DeviceBuffer,
-                 start_pos: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize);
+    fn rope(&self, q: &mut DeviceBuffer, k: &mut DeviceBuffer, positions: &DeviceBuffer, head_dim: usize, theta: f32);
+    fn attention(&self, out: &mut DeviceBuffer, q: &DeviceBuffer, k_pool: &DeviceBuffer, v_pool: &DeviceBuffer,
+                 block_table: &DeviceBuffer, query_starts: &DeviceBuffer, seq_lens: &DeviceBuffer,
+                 n_heads: usize, n_kv_heads: usize, head_dim: usize, block_size: usize, max_blocks_per_seq: usize);
+    fn scatter_kv(&self, pool: &mut DeviceBuffer, src: &DeviceBuffer, slot_mapping: &DeviceBuffer, kv_dim: usize, n: usize);
+    fn gather(&self, out: &mut DeviceBuffer, src: &DeviceBuffer, indices: &DeviceBuffer, n: usize);
+    fn upload_u32(&self, data: &[u32]) -> DeviceBuffer;
     fn silu(&self, x: &mut DeviceBuffer);
     fn mul(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
     fn add(&self, out: &mut DeviceBuffer, a: &DeviceBuffer, b: &DeviceBuffer);
-    fn copy_into(&self, dst: &mut DeviceBuffer, src: &DeviceBuffer, dst_offset_elements: usize);
     fn read_to_vec_f32(&self, buf: &DeviceBuffer) -> Vec<f32>;
 }
 ```
@@ -113,26 +118,36 @@ take exactly the same call. The backend reads `seq_len` from `input.shape[1]` (o
 dispatches GEMV vs GEMM, single-query flash attention vs causal attention. The model layer
 doesn't know or care. `DeviceBuffer` uses `Box<dyn Any>` for type erasure.
 
-### LLaMA Forward Pass (single token at position `pos`)
+### Batched Forward Pass
+The model sees a flat batch of tokens from potentially multiple requests.
+CLI is batch_size=1. Serving batches many requests into one forward pass.
 ```
-x = embed(token)
+x = embed(batch.tokens)                      # [dim, num_tokens]
 for layer in 0..n_layers:
     x_norm = rms_norm(x, attn_norm)
     q, k, v = wq @ x_norm, wk @ x_norm, wv @ x_norm
-    rope(q, k, pos)                          # interleaved pairs: (x[2i], x[2i+1])
-    kv_cache.store(layer, pos, k, v)
-    attn_out = grouped_query_attention(q, kv_cache, layer, 0..pos+1)
-    attn_out = wo @ attn_out
-    x = x + attn_out                         # residual
+    rope(q, k, batch.positions)              # per-token positions buffer
+    scatter_kv(kv_pool, k, batch.slot_mapping)  # write to paged blocks
+    scatter_kv(kv_pool, v, batch.slot_mapping)
+    attn = paged_attention(q, kv_pool, batch.block_tables,
+        batch.query_starts, batch.seq_lens)  # varlen paged GQA
+    x = x + wo @ attn                       # residual
     x_norm = rms_norm(x, ffn_norm)
-    x = x + w2 @ (silu(w1 @ x_norm) * (w3 @ x_norm))  # SwiGLU + residual
-x = rms_norm(x, output_norm)
-logits = output @ x
+    x = x + w2 @ (silu(w1 @ x_norm) * (w3 @ x_norm))  # SwiGLU
+x_logit = gather(x, batch.logit_indices)     # last token per request
+logits = output @ rms_norm(x_logit)
 ```
-GQA: multiple query heads share KV heads (ratio = n_heads / n_kv_heads).
+5 ops change vs unpaged single-sequence: rope (buffer not scalar), scatter_kv
+(replaces copy_into), paged_attention (replaces flash/causal), gather (new).
+Everything else (embed, matmul, rms_norm, silu, mul, add) unchanged.
 
-### KV Cache
-Flat `[max_seq_len, kv_dim]` buffer per layer per K/V. Write at `pos * kv_dim`, read `0..pos+1`. No paging in v0.1.
+### KV Cache (Paged)
+Block-based KV pool. Single large buffer per layer per K/V, divided into 256-token
+blocks. A free list tracks available blocks. Each sequence holds a block table
+(logical block → physical block ID). The `paged_attention` kernel reads KV through
+block-table indirection — one u32 lookup per 32 KV positions, zero overhead.
+CLI allocates blocks sequentially (equivalent to flat cache). Serving shares the
+pool across concurrent requests.
 
 ### Weight Loading
 1. Read entire GGUF file into owned `Vec<u8>` (single `read_exact` — we need all weights)
@@ -201,11 +216,26 @@ Note: Per-kernel GPU timing requires enabling "Shader Timeline" in the Metal App
 - Per-kernel GPU profiling (LLM_PERF=1, GPU timestamps, BW/FLOPS vs SOL)
 - 1B BF16: ~62 tok/s (167 GB/s, 84% SOL), 8B Q4_K_M: ~11.5 tok/s on M1 Pro
 
-### Phase 3: Polish (next)
+### Phase 3: Paged Attention + Batched Forward (done)
+- Paged KV pool with 256-token blocks, free list, block table per sequence
+- Paged varlen attention kernel (replaces flash_attention + causal_attention)
+- scatter_kv for writing K/V to paged pool slots
+- gather for extracting last-token hidden states per request
+- Batch struct: tokens, positions, query_starts, seq_lens, block_tables, slot_mapping
+- CLI uses Batch::single() — same performance as flat cache
+- Model trait: `forward(&mut self, backend, pool, batch)`, no sessions
+
+### Phase 4: Serving (done)
+- tokio + axum HTTP server (OpenAI-compatible `/v1/chat/completions`)
+- Engine thread with unified token budget scheduler (vLLM V1 pattern)
+- Continuous batching: multiple requests in one GPU forward pass
+- Stable request table (MRV2 pattern)
+
+### Phase 5: Polish (next)
+- Prefix caching (hash-based block reuse)
+- Throughput benchmark (`examples/bench_throughput.rs`)
 - Error handling (replace panics with `Result`)
-- Batched prefill (GEMM instead of sequential matvec)
-- CPU backend optimization (Accelerate BLAS, NEON SIMD)
-- MTLBinaryArchive for full GPU ISA pre-compilation (eliminate first-run deferred compilation)
+- MTLBinaryArchive for GPU ISA pre-compilation
 
 ## Verification
 1. **GGUF parser:** tensor count/shapes/metadata match llama.cpp output

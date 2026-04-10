@@ -199,8 +199,9 @@ impl MetalBackend {
             "silu_inplace",
             "add_vecs",
             "mul_vecs",
-            "copy_offset",
-            "flash_attention",
+            "scatter_kv",
+            "gather_cols",
+            "paged_attention",
             "embed_batch_f32",
             "embed_batch_bf16",
             "embed_batch_f16",
@@ -214,7 +215,6 @@ impl MetalBackend {
             "gemm_q4k",
             "gemm_q4k_pipe",
             "gemm_q6k",
-            "causal_attention",
             "argmax",
         ];
 
@@ -745,7 +745,7 @@ impl Backend for MetalBackend {
         &self,
         q: &mut MetalBuffer,
         k: &mut MetalBuffer,
-        start_pos: usize,
+        positions: &MetalBuffer,
         head_dim: usize,
         rope_theta: f32,
         layout: RopeLayout,
@@ -767,7 +767,7 @@ impl Backend for MetalBackend {
                 0,
                 |enc| unsafe {
                     bind_buffer(enc, buf, 0);
-                    bind_u32(enc, start_pos as u32, 1);
+                    bind_buffer(enc, positions, 1);
                     bind_u32(enc, head_dim as u32, 2);
                     bind_f32(enc, rope_theta, 3);
                     bind_u32(enc, pairs_per_row as u32, 4);
@@ -881,89 +881,99 @@ impl Backend for MetalBackend {
         &self,
         out: &mut MetalBuffer,
         q: &MetalBuffer,
-        k_cache: &MetalBuffer,
-        v_cache: &MetalBuffer,
-        start_pos: usize,
+        k_pool: &MetalBuffer,
+        v_pool: &MetalBuffer,
+        block_table: &MetalBuffer,
+        query_starts: &MetalBuffer,
+        seq_lens: &MetalBuffer,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        block_size: usize,
+        max_blocks_per_seq: usize,
     ) {
-        let seq_len = MetalBuffer::seq_len(q);
+        let total_query_tokens = q.n_elements() / (n_heads * head_dim);
+        let num_requests = seq_lens.dim0 as usize;
         let kv_dim = (n_kv_heads * head_dim) as u32;
-        let fa_block = 32;
+        let fa_block = 32usize;
         let n_simdgroups = (head_dim + 31) / 32;
         let shared_mem = (fa_block + n_simdgroups) * 4;
 
-        if seq_len == 1 {
-            // Decode: single-query flash attention.
-            self.dispatch(
-                "flash_attention",
-                Dispatch::Groups(sz(n_heads, 1, 1)),
-                sz(head_dim, 1, 1),
-                shared_mem,
-                |enc| unsafe {
-                    bind_buffer(enc, q, 0);
-                    bind_buffer(enc, k_cache, 1);
-                    bind_buffer(enc, v_cache, 2);
-                    bind_buffer(enc, out, 3);
-                    bind_u32(enc, start_pos as u32, 4);
-                    bind_u32(enc, n_heads as u32, 5);
-                    bind_u32(enc, n_kv_heads as u32, 6);
-                    bind_u32(enc, head_dim as u32, 7);
-                    bind_u32(enc, kv_dim, 8);
-                },
-            );
-            let kv_len = start_pos + 1;
-            let elem = q.dtype.storage_size(1);
-            let bytes = n_heads * head_dim * elem * 2 + kv_len * n_kv_heads * head_dim * elem * 2;
-            self.perf_log("flash_attention", bytes, n_heads * kv_len * head_dim * 4);
-        } else {
-            // Prefill: causal attention over `seq_len` query columns.
-            let n_tg = n_heads * seq_len;
-            self.dispatch(
-                "causal_attention",
-                Dispatch::Groups(sz(n_tg, 1, 1)),
-                sz(head_dim, 1, 1),
-                shared_mem,
-                |enc| unsafe {
-                    bind_buffer(enc, q, 0);
-                    bind_buffer(enc, k_cache, 1);
-                    bind_buffer(enc, v_cache, 2);
-                    bind_buffer(enc, out, 3);
-                    bind_u32(enc, start_pos as u32, 4);
-                    bind_u32(enc, seq_len as u32, 5);
-                    bind_u32(enc, n_heads as u32, 6);
-                    bind_u32(enc, n_kv_heads as u32, 7);
-                    bind_u32(enc, head_dim as u32, 8);
-                    bind_u32(enc, kv_dim, 9);
-                    bind_u32(enc, n_heads as u32, 10);
-                },
-            );
-            let kv_len = start_pos + seq_len;
-            let elem = q.dtype.storage_size(1);
-            let bytes = n_heads * seq_len * head_dim * elem * 2
-                + kv_len * n_kv_heads * head_dim * elem * 2;
-            self.perf_log("causal_attention", bytes, n_heads * seq_len * kv_len * head_dim * 4);
-        }
+        self.dispatch(
+            "paged_attention",
+            Dispatch::Groups(sz(total_query_tokens * n_heads, 1, 1)),
+            sz(head_dim, 1, 1),
+            shared_mem,
+            |enc| unsafe {
+                bind_buffer(enc, q, 0);
+                bind_buffer(enc, k_pool, 1);
+                bind_buffer(enc, v_pool, 2);
+                bind_buffer(enc, out, 3);
+                bind_buffer(enc, block_table, 4);
+                bind_buffer(enc, query_starts, 5);
+                bind_buffer(enc, seq_lens, 6);
+                bind_u32(enc, n_heads as u32, 7);
+                bind_u32(enc, n_kv_heads as u32, 8);
+                bind_u32(enc, head_dim as u32, 9);
+                bind_u32(enc, kv_dim, 10);
+                bind_u32(enc, block_size as u32, 11);
+                bind_u32(enc, max_blocks_per_seq as u32, 12);
+                bind_u32(enc, num_requests as u32, 13);
+            },
+        );
+
+        let elem = q.dtype.storage_size(1);
+        let bytes = total_query_tokens * n_heads * head_dim * elem * 2;
+        self.perf_log("paged_attention", bytes, 0);
     }
 
-    fn copy_into(&self, dst: &mut MetalBuffer, src: &MetalBuffer, dst_offset_elements: usize) {
-        let count = src.n_elements() as u32;
-        let offset = dst_offset_elements as u32;
+    fn scatter_kv(&self, pool: &mut MetalBuffer, src: &MetalBuffer, slot_mapping: &MetalBuffer, kv_dim: usize, num_tokens: usize) {
         self.dispatch(
-            "copy_offset",
-            Dispatch::Threads(sz(count as usize, 1, 1)),
+            "scatter_kv",
+            Dispatch::Threads(sz(kv_dim * num_tokens, 1, 1)),
+            sz(256, 1, 1),
+            0,
+            |enc| unsafe {
+                bind_buffer(enc, pool, 0);
+                bind_buffer(enc, src, 1);
+                bind_buffer(enc, slot_mapping, 2);
+                bind_u32(enc, kv_dim as u32, 3);
+                bind_u32(enc, num_tokens as u32, 4);
+            },
+        );
+
+        self.perf_log("scatter_kv", src.dtype.storage_size(kv_dim * num_tokens) * 2, 0);
+    }
+
+    fn gather(&self, out: &mut MetalBuffer, src: &MetalBuffer, indices: &MetalBuffer, num_indices: usize) {
+        let dim = src.dim0 as usize;
+        self.dispatch(
+            "gather_cols",
+            Dispatch::Threads(sz(dim * num_indices, 1, 1)),
             sz(256, 1, 1),
             0,
             |enc| unsafe {
                 bind_buffer(enc, src, 0);
-                bind_buffer(enc, dst, 1);
-                bind_u32(enc, offset, 2);
-                bind_u32(enc, count, 3);
+                bind_buffer(enc, indices, 1);
+                bind_buffer(enc, out, 2);
+                bind_u32(enc, dim as u32, 3);
+                bind_u32(enc, num_indices as u32, 4);
+                bind_u32(enc, src.seq_len() as u32, 5);
             },
         );
 
-        self.perf_log("copy_offset", src.dtype.storage_size(count as usize) * 2, 0);
+        self.perf_log("gather_cols", src.dtype.storage_size(dim * num_indices) * 2, 0);
+    }
+
+    fn upload_u32(&self, data: &[u32]) -> MetalBuffer {
+        let buf = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new_unchecked(data.as_ptr() as *mut _),
+                data.len() * 4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.expect("Failed to create u32 buffer");
+        MetalBuffer { buf, offset: 0, dtype: DType::I32, dim0: data.len() as u32, dim1: 0 }
     }
 
     fn read_to_vec_f32(&self, buf: &MetalBuffer) -> Vec<f32> {
@@ -991,6 +1001,12 @@ impl Backend for MetalBackend {
         }
     }
 }
+
+// Safety: MetalBuffer and MetalBackend are only ever used from one thread at a
+// time (the engine thread for serving, or the main thread for CLI). We move
+// them across thread boundaries but never share.
+unsafe impl Send for MetalBuffer {}
+unsafe impl Send for MetalBackend {}
 
 impl Drop for MetalBackend {
     fn drop(&mut self) {

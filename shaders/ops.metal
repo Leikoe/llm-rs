@@ -620,73 +620,91 @@ kernel void gemm_q6k(
     }
 }
 
-// ===================== Flash Attention 2 =====================
-// One threadgroup per query head. Tiles over KV in blocks of FA_BLOCK positions.
-// Online softmax: maintains running max (m_i) and sum-of-exp (l_i) across tiles.
-// Shared memory: FA_BLOCK scores + scratch for reductions. O(1) in seq_len.
-// Each thread owns one output dimension and accumulates the weighted value sum.
+// ===================== Paged Varlen Attention =====================
+// Handles any mix of decode (1 query token) and prefill (N query tokens) in
+// one dispatch. KV is read from a paged pool via block_table indirection.
 //
-// Algorithm (per head):
-//   o = 0, m = -inf, l = 0
-//   for each KV tile [t_start..t_end]:
-//     s[j] = dot(q, k[t_start+j]) * scale   (cooperative across threads)
-//     m_new = max(m, max(s))
-//     rescale = exp(m - m_new)
-//     o = o * rescale + sum(exp(s[j] - m_new) * v[t_start+j])
-//     l = l * rescale + sum(exp(s[j] - m_new))
-//     m = m_new
-//   output = o / l
+// Grid: one threadgroup per (global_query_token, head).
+// tgid = global_qi * n_heads + head.
+// Each thread owns one output dimension d < head_dim.
+//
+// For BLOCK_SIZE=256 and FA_BLOCK=32, a tile never crosses a block boundary
+// (256/32 = 8 tiles per block), so the block lookup is one u32 read per tile.
 
 constant constexpr uint FA_BLOCK = 32;
 
-kernel void flash_attention(
-    device const bfloat* q       [[buffer(0)]],
-    device const bfloat* k_cache [[buffer(1)]],
-    device const bfloat* v_cache [[buffer(2)]],
-    device bfloat* output        [[buffer(3)]],
-    constant uint& pos          [[buffer(4)]],
-    constant uint& n_heads      [[buffer(5)]],
-    constant uint& n_kv_heads   [[buffer(6)]],
-    constant uint& head_dim_c   [[buffer(7)]],
-    constant uint& kv_dim       [[buffer(8)]],
-    uint head    [[threadgroup_position_in_grid]],
+kernel void paged_attention(
+    device const bfloat* q             [[buffer(0)]],
+    device const bfloat* k_pool        [[buffer(1)]],
+    device const bfloat* v_pool        [[buffer(2)]],
+    device bfloat* output              [[buffer(3)]],
+    device const uint* block_table     [[buffer(4)]],
+    device const uint* query_starts    [[buffer(5)]],
+    device const uint* seq_lens        [[buffer(6)]],
+    constant uint& n_heads             [[buffer(7)]],
+    constant uint& n_kv_heads          [[buffer(8)]],
+    constant uint& head_dim_c          [[buffer(9)]],
+    constant uint& kv_dim              [[buffer(10)]],
+    constant uint& block_size_c        [[buffer(11)]],
+    constant uint& max_blocks_per_seq  [[buffer(12)]],
+    constant uint& num_requests        [[buffer(13)]],
+    uint tgid    [[threadgroup_position_in_grid]],
     uint d       [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]],
     uint lane    [[thread_index_in_simdgroup]],
     uint sg      [[simdgroup_index_in_threadgroup]],
     threadgroup float* shared   [[threadgroup(0)]])
 {
+    uint head = tgid % n_heads;
+    uint global_qi = tgid / n_heads;
+
+    // Find which request this query token belongs to
+    uint req = 0;
+    while (req + 1 < num_requests && global_qi >= query_starts[req + 1]) req++;
+    uint local_qi = global_qi - query_starts[req];
+    uint q_count = query_starts[req + 1] - query_starts[req];
+
     uint heads_per_kv = n_heads / n_kv_heads;
     uint kv_head = head / heads_per_kv;
-    uint q_off  = head * head_dim_c;
     uint kv_off = kv_head * head_dim_c;
     float scale = rsqrt(float(head_dim_c));
-    uint seq_len = pos + 1;
-    uint n_sg = (tg_size + 31) / 32;
 
-    // Shared memory: [FA_BLOCK scores] [n_sg scratch]
+    // Total KV length for this request, with causal masking for prefill
+    uint kv_len = seq_lens[req];
+    uint causal_len = kv_len - q_count + local_qi + 1;
+
+    // Q offset: q is laid out [n_heads * head_dim, total_query_tokens]
+    uint q_stride = n_heads * head_dim_c;
+    uint q_off = global_qi * q_stride + head * head_dim_c;
+
+    uint n_sg = (tg_size + 31) / 32;
     threadgroup float* scores  = shared;
     threadgroup float* scratch = shared + FA_BLOCK;
 
-    // Per-thread accumulators (each thread owns dimension d < head_dim)
     float o_acc = 0.0;
     float m_i = -INFINITY;
     float l_i = 0.0;
 
-    for (uint t_start = 0; t_start < seq_len; t_start += FA_BLOCK) {
-        uint t_end = min(t_start + FA_BLOCK, seq_len);
+    for (uint t_start = 0; t_start < causal_len; t_start += FA_BLOCK) {
+        uint t_end = min(t_start + FA_BLOCK, causal_len);
         uint tile_len = t_end - t_start;
 
-        // Phase 1: cooperatively compute dot(q, k) for this tile
+        // Block table lookup for KV access
+        uint block_idx = t_start / block_size_c;
+        uint phys_block = block_table[req * max_blocks_per_seq + block_idx];
+        uint block_off = t_start % block_size_c;
+        uint kv_base = phys_block * block_size_c * kv_dim + block_off * kv_dim;
+
+        // Phase 1: dot(q, k) for this tile
         for (uint j = d; j < tile_len; j += tg_size) {
             float dot = 0.0;
             for (uint i = 0; i < head_dim_c; i++)
-                dot += float(q[q_off + i]) * float(k_cache[(t_start + j) * kv_dim + kv_off + i]);
+                dot += float(q[q_off + i]) * float(k_pool[kv_base + j * kv_dim + kv_off + i]);
             scores[j] = dot * scale;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Phase 2: find tile max
+        // Phase 2: tile max
         float tile_max = -INFINITY;
         for (uint j = d; j < tile_len; j += tg_size)
             tile_max = max(tile_max, scores[j]);
@@ -701,13 +719,12 @@ kernel void flash_attention(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         tile_max = scratch[0];
 
-        // Phase 3: online softmax rescale
+        // Phase 3: online softmax
         float m_new = max(m_i, tile_max);
         float rescale = exp(m_i - m_new);
         o_acc *= rescale;
         l_i *= rescale;
 
-        // Compute exp(score - m_new) and tile sum
         float tile_sum = 0.0;
         for (uint j = d; j < tile_len; j += tg_size) {
             float e = exp(scores[j] - m_new);
@@ -729,13 +746,15 @@ kernel void flash_attention(
         // Phase 4: accumulate weighted values
         if (d < head_dim_c) {
             for (uint j = 0; j < tile_len; j++)
-                o_acc += scores[j] * float(v_cache[(t_start + j) * kv_dim + kv_off + d]);
+                o_acc += scores[j] * float(v_pool[kv_base + j * kv_dim + kv_off + d]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    // Write output
+    uint out_off = global_qi * q_stride + head * head_dim_c;
     if (d < head_dim_c)
-        output[q_off + d] = bfloat(o_acc / l_i);
+        output[out_off + d] = bfloat(o_acc / l_i);
 }
 
 // ===================== SiLU =====================
@@ -815,16 +834,42 @@ kernel void argmax(
     if (tid == 0) out[0] = shared_idx[0];
 }
 
-// ===================== Copy with offset =====================
+// ===================== Scatter KV =====================
+// Write K/V vectors into paged pool slots via slot_mapping.
+// 1D grid: kv_dim * num_tokens threads.
 
-kernel void copy_offset(
-    device const bfloat* src [[buffer(0)]],
-    device bfloat* dst       [[buffer(1)]],
-    constant uint& dst_off   [[buffer(2)]],
-    constant uint& count     [[buffer(3)]],
+kernel void scatter_kv(
+    device bfloat* pool              [[buffer(0)]],
+    device const bfloat* src         [[buffer(1)]],
+    device const uint* slot_mapping  [[buffer(2)]],
+    constant uint& kv_dim_c          [[buffer(3)]],
+    constant uint& num_tokens        [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
 {
-    if (tid < count) dst[dst_off + tid] = src[tid];
+    uint token = tid / kv_dim_c;
+    uint d = tid % kv_dim_c;
+    if (token >= num_tokens) return;
+    pool[slot_mapping[token] * kv_dim_c + d] = src[token * kv_dim_c + d];
+}
+
+// ===================== Gather columns =====================
+// Gather columns from a 2D [dim, seq_len] tensor at given indices.
+// 1D grid: dim * num_indices threads.
+
+kernel void gather_cols(
+    device const bfloat* src       [[buffer(0)]],
+    device const uint* indices     [[buffer(1)]],
+    device bfloat* out             [[buffer(2)]],
+    constant uint& dim             [[buffer(3)]],
+    constant uint& num_indices     [[buffer(4)]],
+    constant uint& src_seq_len     [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint col = tid / dim;
+    uint d = tid % dim;
+    if (col >= num_indices) return;
+    uint src_col = indices[col];
+    out[col * dim + d] = src[src_col * dim + d];
 }
 
 // ===================== Batched Embedding =====================
@@ -964,18 +1009,18 @@ kernel void rms_norm_batch(
 // Qwen3/HF-style (NeoX) rope: rotate split pairs (x[i], x[i+head_dim/2]).
 // `neox == 0` picks interleaved, `neox == 1` picks split.
 kernel void rope_batch(
-    device bfloat* x           [[buffer(0)]],
-    constant uint& start_pos   [[buffer(1)]],
-    constant uint& head_dim    [[buffer(2)]],
-    constant float& theta      [[buffer(3)]],
-    constant uint& n_pairs     [[buffer(4)]],
-    constant uint& row_stride  [[buffer(5)]],
-    constant uint& neox        [[buffer(6)]],
+    device bfloat* x              [[buffer(0)]],
+    device const uint* positions  [[buffer(1)]],
+    constant uint& head_dim       [[buffer(2)]],
+    constant float& theta         [[buffer(3)]],
+    constant uint& n_pairs        [[buffer(4)]],
+    constant uint& row_stride     [[buffer(5)]],
+    constant uint& neox           [[buffer(6)]],
     uint2 pos [[thread_position_in_grid]])
 {
     uint pair = pos.x, s = pos.y;
     if (pair >= n_pairs) return;
-    uint p = start_pos + s;
+    uint p = positions[s];
 
     uint half_hd = head_dim / 2;
     uint head = pair / half_hd;
@@ -1133,105 +1178,3 @@ kernel void gemm_f16(
     }
 }
 
-// ===================== Causal Attention =====================
-// 2D grid: (n_heads, batch_seq_len). One threadgroup per (head, query_position).
-// Each query at batch index q_idx attends to KV at positions [0..start_pos+q_idx].
-
-kernel void causal_attention(
-    device const bfloat* q       [[buffer(0)]],
-    device const bfloat* k_cache [[buffer(1)]],
-    device const bfloat* v_cache [[buffer(2)]],
-    device bfloat* output        [[buffer(3)]],
-    constant uint& start_pos    [[buffer(4)]],
-    constant uint& batch_seq_len [[buffer(5)]],
-    constant uint& n_heads      [[buffer(6)]],
-    constant uint& n_kv_heads   [[buffer(7)]],
-    constant uint& head_dim_c   [[buffer(8)]],
-    constant uint& kv_dim       [[buffer(9)]],
-    constant uint& n_heads_grid [[buffer(10)]],
-    uint tgid_flat [[threadgroup_position_in_grid]],
-    uint d       [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint lane    [[thread_index_in_simdgroup]],
-    uint sg      [[simdgroup_index_in_threadgroup]],
-    threadgroup float* shared   [[threadgroup(0)]])
-{
-    uint head  = tgid_flat % n_heads_grid;
-    uint q_idx = tgid_flat / n_heads_grid;
-    uint abs_pos = start_pos + q_idx;
-    uint seq_len = abs_pos + 1;
-
-    uint heads_per_kv = n_heads / n_kv_heads;
-    uint kv_head = head / heads_per_kv;
-    uint dim_stride = n_heads * head_dim_c;
-    uint q_off  = q_idx * dim_stride + head * head_dim_c;
-    uint kv_off = kv_head * head_dim_c;
-    float scale = rsqrt(float(head_dim_c));
-    uint n_sg = (tg_size + 31) / 32;
-
-    threadgroup float* scores  = shared;
-    threadgroup float* scratch = shared + FA_BLOCK;
-
-    float o_acc = 0.0;
-    float m_i = -INFINITY;
-    float l_i = 0.0;
-
-    for (uint t_start = 0; t_start < seq_len; t_start += FA_BLOCK) {
-        uint t_end = min(t_start + FA_BLOCK, seq_len);
-        uint tile_len = t_end - t_start;
-
-        for (uint j = d; j < tile_len; j += tg_size) {
-            float dot = 0.0;
-            for (uint i = 0; i < head_dim_c; i++)
-                dot += float(q[q_off + i]) * float(k_cache[(t_start + j) * kv_dim + kv_off + i]);
-            scores[j] = dot * scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float tile_max = -INFINITY;
-        for (uint j = d; j < tile_len; j += tg_size)
-            tile_max = max(tile_max, scores[j]);
-        tile_max = simd_max(tile_max);
-        if (lane == 0) scratch[sg] = tile_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            float v = (lane < n_sg) ? scratch[lane] : -INFINITY;
-            v = simd_max(v);
-            if (lane == 0) scratch[0] = v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        tile_max = scratch[0];
-
-        float m_new = max(m_i, tile_max);
-        float rescale = exp(m_i - m_new);
-        o_acc *= rescale;
-        l_i *= rescale;
-
-        float tile_sum = 0.0;
-        for (uint j = d; j < tile_len; j += tg_size) {
-            float e = exp(scores[j] - m_new);
-            scores[j] = e;
-            tile_sum += e;
-        }
-        tile_sum = simd_sum(tile_sum);
-        if (lane == 0) scratch[sg] = tile_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            float v = (lane < n_sg) ? scratch[lane] : 0.0;
-            v = simd_sum(v);
-            if (lane == 0) scratch[0] = v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        l_i += scratch[0];
-        m_i = m_new;
-
-        if (d < head_dim_c) {
-            for (uint j = 0; j < tile_len; j++)
-                o_acc += scores[j] * float(v_cache[(t_start + j) * kv_dim + kv_off + d]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (d < head_dim_c)
-        output[q_off + d] = bfloat(o_acc / l_i);
-}

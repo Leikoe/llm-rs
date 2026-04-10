@@ -58,6 +58,18 @@ impl Sampler {
         Sampler { config, rng, indices: Vec::new(), sorted: Vec::new() }
     }
 
+    /// Sample from a CPU-side logit slice. Used by the serving engine after
+    /// reading batched logits to the CPU.
+    pub fn sample_from(&mut self, logits: &mut [f32]) -> u32 {
+        if self.config.temperature == 0.0 {
+            return logits.iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+        self.sample_cpu(logits)
+    }
+
     /// Sample the next token id from on-device logits. Greedy (temp=0) stays
     /// fully on device — only 4 bytes come back. Stochastic paths still need
     /// the full vector CPU-side.
