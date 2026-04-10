@@ -17,20 +17,20 @@ pub struct MetalBuffer {
     /// wrapped a page-rounded-down region.
     offset: usize,
     pub dtype: DType,
-    pub shape: Vec<u64>,
+    /// Contiguous dimension (innermost). For weights: in_features. For activations: dim.
+    pub dim0: u32,
+    /// Outer dimension. 0 for 1D buffers, seq_len for 2D activations, out_features for weights.
+    pub dim1: u32,
 }
 
 impl MetalBuffer {
     pub fn n_elements(&self) -> usize {
-        self.shape.iter().map(|&d| d as usize).product()
+        self.dim0 as usize * self.dim1.max(1) as usize
     }
 
-    /// Number of columns. 1D shapes (decode) → 1, 2D shapes (prefill) → shape[1].
-    /// This is the only thing the backend needs to tell decode and prefill apart.
     pub fn seq_len(&self) -> usize {
-        if self.shape.len() > 1 { self.shape[1] as usize } else { 1 }
+        self.dim1.max(1) as usize
     }
-
 }
 
 const PAGE_SIZE: usize = 16384;
@@ -457,7 +457,7 @@ impl Backend for MetalBackend {
                 let dst = buf.contents().as_ptr() as *mut u8;
                 std::ptr::copy_nonoverlapping(repacked.as_ptr(), dst, repacked.len());
             }
-            return MetalBuffer { buf, offset: 0, dtype: tv.dtype, shape: tv.shape.to_vec() };
+            return MetalBuffer { buf, offset: 0, dtype: tv.dtype, dim0: tv.shape[0] as u32, dim1: if tv.shape.len() > 1 { tv.shape[1] as u32 } else { 0 } };
         }
 
         // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
@@ -480,7 +480,7 @@ impl Backend for MetalBackend {
             )
         }
         .expect("Failed to create no-copy buffer");
-        MetalBuffer { buf, offset, dtype: tv.dtype, shape: tv.shape.to_vec() }
+        MetalBuffer { buf, offset, dtype: tv.dtype, dim0: tv.shape[0] as u32, dim1: if tv.shape.len() > 1 { tv.shape[1] as u32 } else { 0 } }
     }
 
     fn alloc(&self, shape: &[u64], dtype: DType) -> MetalBuffer {
@@ -490,12 +490,12 @@ impl Backend for MetalBackend {
             .device
             .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
             .expect("Failed to alloc buffer");
-        MetalBuffer { buf, offset: 0, dtype, shape: shape.to_vec() }
+        MetalBuffer { buf, offset: 0, dtype, dim0: shape[0] as u32, dim1: if shape.len() > 1 { shape[1] as u32 } else { 0 } }
     }
 
     fn matmul(&self, out: &mut MetalBuffer, weight: &MetalBuffer, input: &MetalBuffer) {
-        let in_f = weight.shape[0] as u32;
-        let out_f = weight.shape[1] as u32;
+        let in_f = weight.dim0;
+        let out_f = weight.dim1;
         let seq_len = input.seq_len() as u32;
 
         // Decode (single column): always dispatch the optimized SIMD matvec.
@@ -857,7 +857,7 @@ impl Backend for MetalBackend {
             DType::Q6K => "embed_batch_q6k",
             _ => unimplemented!("embed for {:?}", table.dtype),
         };
-        let dim = table.shape[0] as u32;
+        let dim = table.dim0 as u32;
 
         self.dispatch(
             kernel,
