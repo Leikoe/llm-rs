@@ -2,12 +2,12 @@ pub mod metadata;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Cursor, Read};
+use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::Instant;
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{ByteOrder, LittleEndian};
 use crate::tensor::{DType, TensorView};
 use metadata::{MetadataArray, MetadataValue};
 
@@ -16,17 +16,14 @@ const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 
 #[derive(Debug)]
 pub struct TensorInfo {
-    pub name: String,
-    pub shape: Vec<u64>,
+    /// Byte range of the name within the GGUF buffer.
+    name_start: usize,
+    name_len: usize,
+    /// Byte offset of the shape u64s within the GGUF buffer.
+    shape_start: usize,
+    n_dims: usize,
     pub dtype: DType,
     pub offset: u64,
-}
-
-impl TensorInfo {
-    pub fn size_bytes(&self) -> usize {
-        let n: usize = self.shape.iter().map(|&d| d as usize).product();
-        self.dtype.storage_size(n)
-    }
 }
 
 /// Page-aligned, page-padded heap buffer backed by an anonymous mmap.
@@ -35,8 +32,8 @@ impl TensorInfo {
 /// page-aligned subregion safely (the trailing pages are valid memory).
 pub struct AlignedBuf {
     ptr: *mut u8,
-    len: usize,        // logical length (file size)
-    mmap_len: usize,   // physical mapping length (multiple of PAGE_SIZE)
+    len: usize,
+    mmap_len: usize,
 }
 
 const PAGE_SIZE: usize = 16384;
@@ -65,9 +62,6 @@ impl AlignedBuf {
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr }
-
-    /// Total mapped length (page-padded). The region [ptr, ptr+mmap_len) is
-    /// all valid memory — needed for Metal to safely wrap with newBufferWithBytesNoCopy.
     pub fn mmap_len(&self) -> usize { self.mmap_len }
     pub fn base_ptr(&self) -> *const u8 { self.ptr }
 }
@@ -101,9 +95,7 @@ pub enum GgufError {
 }
 
 impl From<io::Error> for GgufError {
-    fn from(e: io::Error) -> Self {
-        GgufError::Io(e)
-    }
+    fn from(e: io::Error) -> Self { GgufError::Io(e) }
 }
 
 impl std::fmt::Display for GgufError {
@@ -122,6 +114,55 @@ impl std::fmt::Display for GgufError {
 
 impl std::error::Error for GgufError {}
 
+/// Zero-copy cursor into a byte slice. Unlike std::io::Cursor, records byte
+/// positions so we can borrow &str and &[u64] directly from the buffer.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self { Reader { buf, pos: 0 } }
+
+    fn u8(&mut self) -> u8 { let v = self.buf[self.pos]; self.pos += 1; v }
+    fn i8(&mut self) -> i8 { self.u8() as i8 }
+    fn u16(&mut self) -> u16 { let v = LittleEndian::read_u16(&self.buf[self.pos..]); self.pos += 2; v }
+    fn i16(&mut self) -> i16 { self.u16() as i16 }
+    fn u32(&mut self) -> u32 { let v = LittleEndian::read_u32(&self.buf[self.pos..]); self.pos += 4; v }
+    fn i32(&mut self) -> i32 { self.u32() as i32 }
+    fn f32(&mut self) -> f32 { let v = LittleEndian::read_f32(&self.buf[self.pos..]); self.pos += 4; v }
+    fn u64(&mut self) -> u64 { let v = LittleEndian::read_u64(&self.buf[self.pos..]); self.pos += 8; v }
+    fn i64(&mut self) -> i64 { self.u64() as i64 }
+    fn f64(&mut self) -> f64 { let v = LittleEndian::read_f64(&self.buf[self.pos..]); self.pos += 8; v }
+
+    /// Read a GGUF string, returning a borrowed &str into the underlying buffer.
+    fn str(&mut self) -> Result<&'a str, GgufError> {
+        let len = self.u64() as usize;
+        let s = std::str::from_utf8(&self.buf[self.pos..self.pos + len])
+            .map_err(|_| GgufError::InvalidUtf8)?;
+        self.pos += len;
+        Ok(s)
+    }
+
+    /// Record the byte position and length of a string without copying.
+    fn str_range(&mut self) -> Result<(usize, usize), GgufError> {
+        let len = self.u64() as usize;
+        let start = self.pos;
+        // Validate UTF-8
+        std::str::from_utf8(&self.buf[start..start + len])
+            .map_err(|_| GgufError::InvalidUtf8)?;
+        self.pos += len;
+        Ok((start, len))
+    }
+
+    /// Record the byte position of n_dims contiguous u64 shape values.
+    fn shape_range(&mut self, n_dims: usize) -> (usize, usize) {
+        let start = self.pos;
+        self.pos += n_dims * 8;
+        (start, n_dims)
+    }
+}
+
 impl GgufFile {
     pub fn open(path: &Path) -> Result<Self, GgufError> {
         let start = Instant::now();
@@ -134,99 +175,104 @@ impl GgufFile {
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!("Read model weights into RAM: {:.2} GB in {:.3}s ({:.1} GB/s)", gb, elapsed, gb / elapsed);
 
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut r = Reader::new(data.as_slice());
 
-        let magic = cursor.read_u32::<LittleEndian>()?;
+        let magic = r.u32();
         if magic != GGUF_MAGIC {
             return Err(GgufError::InvalidMagic(magic));
         }
 
-        let version = cursor.read_u32::<LittleEndian>()?;
+        let version = r.u32();
         if version < 2 || version > 3 {
             return Err(GgufError::UnsupportedVersion(version));
         }
 
-        let tensor_count = cursor.read_u64::<LittleEndian>()? as usize;
-        let metadata_kv_count = cursor.read_u64::<LittleEndian>()? as usize;
+        let tensor_count = r.u64() as usize;
+        let metadata_kv_count = r.u64() as usize;
 
+        // Metadata keys must be owned Strings because they're HashMap keys.
+        // Values with strings also need owned copies (tokenizer vocab etc.).
         let mut metadata = HashMap::with_capacity(metadata_kv_count);
         for _ in 0..metadata_kv_count {
-            let key = read_string(&mut cursor)?;
-            let value = read_metadata_value(&mut cursor)?;
+            let key = r.str()?.to_string();
+            let value = read_metadata_value(&mut r)?;
             metadata.insert(key, value);
         }
 
+        // Tensor info: names and shapes borrow directly from the buffer.
         let mut tensors = Vec::with_capacity(tensor_count);
         for _ in 0..tensor_count {
-            let name = read_string(&mut cursor)?;
-            let n_dims = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(cursor.read_u64::<LittleEndian>()?);
-            }
-            let dtype_id = cursor.read_u32::<LittleEndian>()?;
+            let (name_start, name_len) = r.str_range()?;
+            let n_dims = r.u32() as usize;
+            let (shape_start, _) = r.shape_range(n_dims);
+            let dtype_id = r.u32();
             let dtype = DType::from_gguf_type(dtype_id)
                 .ok_or(GgufError::UnknownDType(dtype_id))?;
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            tensors.push(TensorInfo { name, shape, dtype, offset });
+            let offset = r.u64();
+            tensors.push(TensorInfo { name_start, name_len, shape_start, n_dims, dtype, offset });
         }
 
-        let header_end = cursor.position() as usize;
-        let data_offset = (header_end + GGUF_DEFAULT_ALIGNMENT - 1) & !(GGUF_DEFAULT_ALIGNMENT - 1);
+        let data_offset = (r.pos + GGUF_DEFAULT_ALIGNMENT - 1) & !(GGUF_DEFAULT_ALIGNMENT - 1);
 
         Ok(GgufFile { version, metadata, tensors, data, data_offset })
     }
 
-    /// Page-aligned base pointer of the underlying allocation. Length is page-padded.
-    /// Used by the Metal backend for zero-copy tensor uploads via newBufferWithBytesNoCopy.
     pub fn aligned_base(&self) -> (*const u8, usize) {
         (self.data.base_ptr(), self.data.mmap_len())
     }
 
+    fn tensor_name(&self, info: &TensorInfo) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.data.as_slice()[info.name_start..info.name_start + info.name_len]) }
+    }
+
+    fn tensor_shape(&self, info: &TensorInfo) -> &[u64] {
+        let bytes = &self.data.as_slice()[info.shape_start..info.shape_start + info.n_dims * 8];
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, info.n_dims) }
+    }
+
+    fn tensor_size_bytes(info: &TensorInfo, shape: &[u64]) -> usize {
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        info.dtype.storage_size(n)
+    }
+
     pub fn tensor_view(&self, name: &str) -> Result<TensorView<'_>, GgufError> {
-        let info = self.tensors.iter().find(|t| t.name == name)
+        let info = self.tensors.iter().find(|t| self.tensor_name(t) == name)
             .ok_or_else(|| GgufError::TensorNotFound(name.to_string()))?;
+        let shape = self.tensor_shape(info);
         let start = self.data_offset + info.offset as usize;
-        let size = info.size_bytes();
+        let size = Self::tensor_size_bytes(info, shape);
         Ok(TensorView {
-            name: &info.name,
+            name: self.tensor_name(info),
             dtype: info.dtype,
-            shape: &info.shape,
+            shape,
             data: &self.data.as_slice()[start..start + size],
         })
     }
 }
 
-fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String, GgufError> {
-    let len = cursor.read_u64::<LittleEndian>()? as usize;
-    let mut buf = vec![0u8; len];
-    cursor.read_exact(&mut buf)?;
-    String::from_utf8(buf).map_err(|_| GgufError::InvalidUtf8)
-}
-
-fn read_metadata_value(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue, GgufError> {
-    let value_type = cursor.read_u32::<LittleEndian>()?;
-    match value_type {
-        0 => Ok(MetadataValue::U8(cursor.read_u8()?)),
-        1 => Ok(MetadataValue::I8(cursor.read_i8()?)),
-        2 => Ok(MetadataValue::U16(cursor.read_u16::<LittleEndian>()?)),
-        3 => Ok(MetadataValue::I16(cursor.read_i16::<LittleEndian>()?)),
-        4 => Ok(MetadataValue::U32(cursor.read_u32::<LittleEndian>()?)),
-        5 => Ok(MetadataValue::I32(cursor.read_i32::<LittleEndian>()?)),
-        6 => Ok(MetadataValue::F32(cursor.read_f32::<LittleEndian>()?)),
-        7 => Ok(MetadataValue::Bool(cursor.read_u8()? != 0)),
-        8 => Ok(MetadataValue::String(read_string(cursor)?)),
-        9 => read_metadata_array(cursor),
-        10 => Ok(MetadataValue::U64(cursor.read_u64::<LittleEndian>()?)),
-        11 => Ok(MetadataValue::I64(cursor.read_i64::<LittleEndian>()?)),
-        12 => Ok(MetadataValue::F64(cursor.read_f64::<LittleEndian>()?)),
-        _ => Err(GgufError::UnknownMetadataType(value_type)),
+fn read_metadata_value(r: &mut Reader) -> Result<MetadataValue, GgufError> {
+    let vtype = r.u32();
+    match vtype {
+        0 => Ok(MetadataValue::U8(r.u8())),
+        1 => Ok(MetadataValue::I8(r.i8())),
+        2 => Ok(MetadataValue::U16(r.u16())),
+        3 => Ok(MetadataValue::I16(r.i16())),
+        4 => Ok(MetadataValue::U32(r.u32())),
+        5 => Ok(MetadataValue::I32(r.i32())),
+        6 => Ok(MetadataValue::F32(r.f32())),
+        7 => Ok(MetadataValue::Bool(r.u8() != 0)),
+        8 => Ok(MetadataValue::String(r.str()?.to_string())),
+        9 => read_metadata_array(r),
+        10 => Ok(MetadataValue::U64(r.u64())),
+        11 => Ok(MetadataValue::I64(r.i64())),
+        12 => Ok(MetadataValue::F64(r.f64())),
+        _ => Err(GgufError::UnknownMetadataType(vtype)),
     }
 }
 
-fn read_metadata_array(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue, GgufError> {
-    let element_type = cursor.read_u32::<LittleEndian>()?;
-    let count = cursor.read_u64::<LittleEndian>()? as usize;
+fn read_metadata_array(r: &mut Reader) -> Result<MetadataValue, GgufError> {
+    let etype = r.u32();
+    let count = r.u64() as usize;
 
     macro_rules! read_array {
         ($variant:ident, $read:expr) => {{
@@ -236,25 +282,24 @@ fn read_metadata_array(cursor: &mut Cursor<&[u8]>) -> Result<MetadataValue, Gguf
         }};
     }
 
-    match element_type {
-        0 => read_array!(U8, cursor.read_u8()?),
-        1 => read_array!(I8, cursor.read_i8()?),
-        2 => read_array!(U16, cursor.read_u16::<LittleEndian>()?),
-        3 => read_array!(I16, cursor.read_i16::<LittleEndian>()?),
-        4 => read_array!(U32, cursor.read_u32::<LittleEndian>()?),
-        5 => read_array!(I32, cursor.read_i32::<LittleEndian>()?),
-        6 => read_array!(F32, cursor.read_f32::<LittleEndian>()?),
-        7 => read_array!(Bool, cursor.read_u8()? != 0),
-        8 => read_array!(String, read_string(cursor)?),
-        10 => read_array!(U64, cursor.read_u64::<LittleEndian>()?),
-        11 => read_array!(I64, cursor.read_i64::<LittleEndian>()?),
-        12 => read_array!(F64, cursor.read_f64::<LittleEndian>()?),
-        _ => Err(GgufError::UnknownMetadataType(element_type)),
+    match etype {
+        0 => read_array!(U8, r.u8()),
+        1 => read_array!(I8, r.i8()),
+        2 => read_array!(U16, r.u16()),
+        3 => read_array!(I16, r.i16()),
+        4 => read_array!(U32, r.u32()),
+        5 => read_array!(I32, r.i32()),
+        6 => read_array!(F32, r.f32()),
+        7 => read_array!(Bool, r.u8() != 0),
+        8 => read_array!(String, r.str()?.to_string()),
+        10 => read_array!(U64, r.u64()),
+        11 => read_array!(I64, r.i64()),
+        12 => read_array!(F64, r.f64()),
+        _ => Err(GgufError::UnknownMetadataType(etype)),
     }
 }
 
 /// Parallel pread to saturate NVMe queue depth.
-/// ~5 GB/s cold (SSD-bound), ~18 GB/s warm (4x over single-threaded read_exact).
 fn read_file_fast(file: &File, size: usize) -> io::Result<AlignedBuf> {
     let fd = file.as_raw_fd();
     let mut data = AlignedBuf::alloc(size)?;
@@ -291,4 +336,3 @@ fn read_file_fast(file: &File, size: usize) -> io::Result<AlignedBuf> {
 
     Ok(data)
 }
-
