@@ -95,18 +95,16 @@ fn check_matmul_q4k<B: Backend>(backend: &B, in_f: usize, out_f: usize, seq_len:
     let w_bytes = random_q4k_bytes(in_f * out_f, &mut rng);
     let i_bytes = random_bf16_bytes(in_f * seq_len, &mut rng);
 
+    let w_shape = [in_f as u64, out_f as u64];
     let weight = backend.upload_tensor(&TensorView {
-        name: "w".into(), dtype: DType::Q4K,
-        shape: vec![in_f as u64, out_f as u64], data: &w_bytes,
+        name: "w", dtype: DType::Q4K,
+        shape: &w_shape, data: &w_bytes,
     });
-    let input_shape: Vec<u64> = if seq_len == 1 {
-        vec![in_f as u64]
-    } else {
-        vec![in_f as u64, seq_len as u64]
-    };
+    let i_shape_1d = [in_f as u64];
+    let i_shape_2d = [in_f as u64, seq_len as u64];
     let input = backend.upload_tensor(&TensorView {
-        name: "x".into(), dtype: DType::BF16,
-        shape: input_shape, data: &i_bytes,
+        name: "x", dtype: DType::BF16,
+        shape: if seq_len == 1 { &i_shape_1d } else { &i_shape_2d }, data: &i_bytes,
     });
     let out_shape: Vec<u64> = if seq_len == 1 {
         vec![out_f as u64]

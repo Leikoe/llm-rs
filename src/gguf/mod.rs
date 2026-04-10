@@ -189,9 +189,9 @@ impl GgufFile {
         let start = self.data_offset + info.offset as usize;
         let size = info.size_bytes();
         Ok(TensorView {
-            name: info.name.clone(),
+            name: &info.name,
             dtype: info.dtype,
-            shape: info.shape.clone(),
+            shape: &info.shape,
             data: &self.data.as_slice()[start..start + size],
         })
     }

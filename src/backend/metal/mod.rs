@@ -8,6 +8,7 @@ use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 
 use crate::backend::Backend;
+use crate::model::RopeLayout;
 use crate::tensor::{DType, TensorView};
 
 pub struct MetalBuffer {
@@ -176,6 +177,11 @@ pub struct MetalBackend {
 }
 
 
+enum Dispatch {
+    Threads(MTLSize),
+    Groups(MTLSize),
+}
+
 impl MetalBackend {
     pub fn new() -> Self {
         let device = MTLCreateSystemDefaultDevice().expect("No Metal device");
@@ -279,10 +285,10 @@ impl MetalBackend {
         }
     }
 
-    fn encode(
+    fn dispatch(
         &self,
         pipeline: &'static str,
-        grid: MTLSize,
+        mode: Dispatch,
         tg: MTLSize,
         tg_mem: usize,
         setup: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
@@ -304,39 +310,10 @@ impl MetalBackend {
                 s.encoder
                     .setThreadgroupMemoryLength_atIndex(tg_mem as _, 0);
             }
-            s.encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
-            s.encoder
-                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        }
-    }
-
-    fn encode_groups(
-        &self,
-        pipeline: &'static str,
-        groups: MTLSize,
-        tg: MTLSize,
-        tg_mem: usize,
-        setup: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
-    ) {
-        let mut state = self.cmd.borrow_mut();
-        let s = state.get_or_insert_with(|| {
-            let cb = self.queue.commandBuffer().unwrap();
-            let enc = cb.computeCommandEncoder().unwrap();
-            CmdState {
-                cmd_buf: cb,
-                encoder: enc,
+            match mode {
+                Dispatch::Threads(grid) => s.encoder.dispatchThreads_threadsPerThreadgroup(grid, tg),
+                Dispatch::Groups(groups) => s.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, tg),
             }
-        });
-        let pso = &self.pipelines[pipeline];
-        unsafe {
-            s.encoder.setComputePipelineState(pso);
-            setup(&s.encoder);
-            if tg_mem > 0 {
-                s.encoder
-                    .setThreadgroupMemoryLength_atIndex(tg_mem as _, 0);
-            }
-            s.encoder
-                .dispatchThreadgroups_threadsPerThreadgroup(groups, tg);
             s.encoder
                 .memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
@@ -432,7 +409,7 @@ fn sz(w: usize, h: usize, d: usize) -> MTLSize {
     }
 }
 
-unsafe fn set_buf(
+unsafe fn bind_buffer(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     buf: &MetalBuffer,
     idx: usize,
@@ -440,7 +417,7 @@ unsafe fn set_buf(
     unsafe { enc.setBuffer_offset_atIndex(Some(&buf.buf), buf.offset, idx) };
 }
 
-unsafe fn set_u32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: u32, idx: usize) {
+unsafe fn bind_u32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: u32, idx: usize) {
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new_unchecked(&val as *const u32 as *mut _),
@@ -450,7 +427,7 @@ unsafe fn set_u32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: u32, 
     };
 }
 
-unsafe fn set_f32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: f32, idx: usize) {
+unsafe fn bind_f32(enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, val: f32, idx: usize) {
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new_unchecked(&val as *const f32 as *mut _),
@@ -481,7 +458,7 @@ impl Backend for MetalBackend {
                 let dst = buf.contents().as_ptr() as *mut u8;
                 std::ptr::copy_nonoverlapping(repacked.as_ptr(), dst, repacked.len());
             }
-            return MetalBuffer { buf, offset: 0, dtype: tv.dtype, shape: tv.shape.clone() };
+            return MetalBuffer { buf, offset: 0, dtype: tv.dtype, shape: tv.shape.to_vec() };
         }
 
         // Zero-copy upload: wrap the GGUF buffer region directly. UMA on Apple Silicon
@@ -504,7 +481,7 @@ impl Backend for MetalBackend {
             )
         }
         .expect("Failed to create no-copy buffer");
-        MetalBuffer { buf, offset, dtype: tv.dtype, shape: tv.shape.clone() }
+        MetalBuffer { buf, offset, dtype: tv.dtype, shape: tv.shape.to_vec() }
     }
 
     fn alloc(&self, shape: &[u64], dtype: DType) -> MetalBuffer {
@@ -542,17 +519,17 @@ impl Backend for MetalBackend {
             };
             let rows_per_tg = nr * nsg;
             let n_tg = (out_f as usize + rows_per_tg - 1) / rows_per_tg;
-            self.encode_groups(
+            self.dispatch(
                 kernel,
-                sz(n_tg, 1, 1),
+                Dispatch::Groups(sz(n_tg, 1, 1)),
                 sz(nsg * 32, 1, 1),
                 0,
                 |enc| unsafe {
-                    set_buf(enc, weight, 0);
-                    set_buf(enc, input, 1);
-                    set_buf(enc, out, 2);
-                    set_u32(enc, in_f, 3);
-                    set_u32(enc, out_f, 4);
+                    bind_buffer(enc, weight, 0);
+                    bind_buffer(enc, input, 1);
+                    bind_buffer(enc, out, 2);
+                    bind_u32(enc, in_f, 3);
+                    bind_u32(enc, out_f, 4);
                 },
             );
 
@@ -634,18 +611,18 @@ impl Backend for MetalBackend {
                 }
             };
 
-            self.encode_groups(
+            self.dispatch(
                 kernel,
-                sz(n_tg_x, n_tg_y, 1),
+                Dispatch::Groups(sz(n_tg_x, n_tg_y, 1)),
                 sz(nsg * 32, 1, 1),
                 0,  // shader uses static threadgroup arrays
                 |enc| unsafe {
-                    set_buf(enc, weight, 0);
-                    set_buf(enc, input, 1);
-                    set_buf(enc, out, 2);
-                    set_u32(enc, in_f, 3);
-                    set_u32(enc, out_f, 4);
-                    set_u32(enc, seq_len, 5);
+                    bind_buffer(enc, weight, 0);
+                    bind_buffer(enc, input, 1);
+                    bind_buffer(enc, out, 2);
+                    bind_u32(enc, in_f, 3);
+                    bind_u32(enc, out_f, 4);
+                    bind_u32(enc, seq_len, 5);
                 },
             );
 
@@ -689,8 +666,8 @@ impl Backend for MetalBackend {
             unsafe {
                 s.encoder.setComputePipelineState(pso);
                 s.encoder.setBuffer_offset_atIndex(Some(&weight.buf), weight.offset, 0);
-                set_u32(&s.encoder, in_f, 3);
-                set_u32(&s.encoder, out_f, 4);
+                bind_u32(&s.encoder, in_f, 3);
+                bind_u32(&s.encoder, out_f, 4);
 
                 for pos in 0..seq_len as usize {
                     s.encoder.setBuffer_offset_atIndex(Some(&input.buf), input.offset + pos * in_stride, 1);
@@ -721,17 +698,17 @@ impl Backend for MetalBackend {
         let seq_len = MetalBuffer::seq_len(input);
         let tg = 1024usize.min(dim as usize);
         let shared = (((tg) + 31) / 32) * 4;
-        self.encode_groups(
+        self.dispatch(
             "rms_norm_batch",
-            sz(seq_len, 1, 1),
+            Dispatch::Groups(sz(seq_len, 1, 1)),
             sz(tg, 1, 1),
             shared,
             |enc| unsafe {
-                set_buf(enc, input, 0);
-                set_buf(enc, weight, 1);
-                set_buf(enc, out, 2);
-                set_u32(enc, dim, 3);
-                set_f32(enc, eps, 4);
+                bind_buffer(enc, input, 0);
+                bind_buffer(enc, weight, 1);
+                bind_buffer(enc, out, 2);
+                bind_u32(enc, dim, 3);
+                bind_f32(enc, eps, 4);
             },
         );
 
@@ -746,17 +723,17 @@ impl Backend for MetalBackend {
         let n_groups = x.n_elements() / dim as usize;
         let tg = 1024usize.min(dim as usize);
         let shared = (((tg) + 31) / 32) * 4;
-        self.encode_groups(
+        self.dispatch(
             "rms_norm_batch",
-            sz(n_groups, 1, 1),
+            Dispatch::Groups(sz(n_groups, 1, 1)),
             sz(tg, 1, 1),
             shared,
             |enc| unsafe {
-                set_buf(enc, x, 0);
-                set_buf(enc, weight, 1);
-                set_buf(enc, x, 2);
-                set_u32(enc, dim, 3);
-                set_f32(enc, eps, 4);
+                bind_buffer(enc, x, 0);
+                bind_buffer(enc, weight, 1);
+                bind_buffer(enc, x, 2);
+                bind_u32(enc, dim, 3);
+                bind_f32(enc, eps, 4);
             },
         );
 
@@ -772,28 +749,31 @@ impl Backend for MetalBackend {
         start_pos: usize,
         head_dim: usize,
         rope_theta: f32,
-        neox: bool,
+        layout: RopeLayout,
     ) {
         let seq_len = MetalBuffer::seq_len(q);
-        let neox_flag: u32 = if neox { 1 } else { 0 };
+        let neox_flag: u32 = match layout {
+            RopeLayout::SplitHalf => 1,
+            RopeLayout::Interleaved => 0,
+        };
 
         let dispatch = |buf: &mut MetalBuffer| {
             let total = buf.n_elements();
             let row_stride = total / seq_len;
             let pairs_per_row = row_stride / 2;
-            self.encode(
+            self.dispatch(
                 "rope_batch",
-                sz(pairs_per_row, seq_len, 1),
+                Dispatch::Threads(sz(pairs_per_row, seq_len, 1)),
                 sz(256, 1, 1),
                 0,
                 |enc| unsafe {
-                    set_buf(enc, buf, 0);
-                    set_u32(enc, start_pos as u32, 1);
-                    set_u32(enc, head_dim as u32, 2);
-                    set_f32(enc, rope_theta, 3);
-                    set_u32(enc, pairs_per_row as u32, 4);
-                    set_u32(enc, row_stride as u32, 5);
-                    set_u32(enc, neox_flag, 6);
+                    bind_buffer(enc, buf, 0);
+                    bind_u32(enc, start_pos as u32, 1);
+                    bind_u32(enc, head_dim as u32, 2);
+                    bind_f32(enc, rope_theta, 3);
+                    bind_u32(enc, pairs_per_row as u32, 4);
+                    bind_u32(enc, row_stride as u32, 5);
+                    bind_u32(enc, neox_flag, 6);
                 },
             );
         };
@@ -807,9 +787,9 @@ impl Backend for MetalBackend {
 
     fn silu(&self, x: &mut MetalBuffer) {
         let n = x.n_elements() as u32;
-        self.encode("silu_inplace", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, x, 0);
-            set_u32(enc, n, 1);
+        self.dispatch("silu_inplace", Dispatch::Threads(sz(n as usize, 1, 1)), sz(256, 1, 1), 0, |enc| unsafe {
+            bind_buffer(enc, x, 0);
+            bind_u32(enc, n, 1);
         });
 
         self.perf_log("silu", x.dtype.storage_size(n as usize) * 2, 4 * n as usize);
@@ -817,11 +797,11 @@ impl Backend for MetalBackend {
 
     fn mul(&self, out: &mut MetalBuffer, a: &MetalBuffer, b: &MetalBuffer) {
         let n = a.n_elements() as u32;
-        self.encode("mul_vecs", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, a, 0);
-            set_buf(enc, b, 1);
-            set_buf(enc, out, 2);
-            set_u32(enc, n, 3);
+        self.dispatch("mul_vecs", Dispatch::Threads(sz(n as usize, 1, 1)), sz(256, 1, 1), 0, |enc| unsafe {
+            bind_buffer(enc, a, 0);
+            bind_buffer(enc, b, 1);
+            bind_buffer(enc, out, 2);
+            bind_u32(enc, n, 3);
         });
 
         self.perf_log("mul", a.dtype.storage_size(n as usize) * 3, n as usize);
@@ -829,11 +809,11 @@ impl Backend for MetalBackend {
 
     fn add(&self, out: &mut MetalBuffer, a: &MetalBuffer, b: &MetalBuffer) {
         let n = a.n_elements() as u32;
-        self.encode("add_vecs", sz(n as usize, 1, 1), sz(256, 1, 1), 0, |enc| unsafe {
-            set_buf(enc, a, 0);
-            set_buf(enc, b, 1);
-            set_buf(enc, out, 2);
-            set_u32(enc, n, 3);
+        self.dispatch("add_vecs", Dispatch::Threads(sz(n as usize, 1, 1)), sz(256, 1, 1), 0, |enc| unsafe {
+            bind_buffer(enc, a, 0);
+            bind_buffer(enc, b, 1);
+            bind_buffer(enc, out, 2);
+            bind_u32(enc, n, 3);
         });
 
         self.perf_log("add", a.dtype.storage_size(n as usize) * 3, n as usize);
@@ -843,15 +823,15 @@ impl Backend for MetalBackend {
         assert!(matches!(logits.dtype, DType::BF16), "argmax expects BF16 logits");
         let n = logits.n_elements() as u32;
         let out = self.alloc(&[1], DType::I32);
-        self.encode_groups(
+        self.dispatch(
             "argmax",
-            sz(1, 1, 1),
+            Dispatch::Groups(sz(1, 1, 1)),
             sz(256, 1, 1),
             0,
             |enc| unsafe {
-                set_buf(enc, logits, 0);
-                set_buf(enc, &out, 1);
-                set_u32(enc, n, 2);
+                bind_buffer(enc, logits, 0);
+                bind_buffer(enc, &out, 1);
+                bind_u32(enc, n, 2);
             },
         );
         self.flush();
@@ -880,17 +860,17 @@ impl Backend for MetalBackend {
         };
         let dim = table.shape[0] as u32;
 
-        self.encode(
+        self.dispatch(
             kernel,
-            sz(dim as usize, seq_len, 1),
+            Dispatch::Threads(sz(dim as usize, seq_len, 1)),
             sz(256, 1, 1),
             0,
             |enc| unsafe {
-                set_buf(enc, table, 0);
+                bind_buffer(enc, table, 0);
                 enc.setBuffer_offset_atIndex(Some(&token_buf), 0, 1);
-                set_buf(enc, out, 2);
-                set_u32(enc, dim, 3);
-                set_u32(enc, seq_len as u32, 4);
+                bind_buffer(enc, out, 2);
+                bind_u32(enc, dim, 3);
+                bind_u32(enc, seq_len as u32, 4);
             },
         );
 
@@ -917,21 +897,21 @@ impl Backend for MetalBackend {
 
         if seq_len == 1 {
             // Decode: single-query flash attention.
-            self.encode_groups(
+            self.dispatch(
                 "flash_attention",
-                sz(n_heads, 1, 1),
+                Dispatch::Groups(sz(n_heads, 1, 1)),
                 sz(head_dim, 1, 1),
                 shared_mem,
                 |enc| unsafe {
-                    set_buf(enc, q, 0);
-                    set_buf(enc, k_cache, 1);
-                    set_buf(enc, v_cache, 2);
-                    set_buf(enc, out, 3);
-                    set_u32(enc, start_pos as u32, 4);
-                    set_u32(enc, n_heads as u32, 5);
-                    set_u32(enc, n_kv_heads as u32, 6);
-                    set_u32(enc, head_dim as u32, 7);
-                    set_u32(enc, kv_dim, 8);
+                    bind_buffer(enc, q, 0);
+                    bind_buffer(enc, k_cache, 1);
+                    bind_buffer(enc, v_cache, 2);
+                    bind_buffer(enc, out, 3);
+                    bind_u32(enc, start_pos as u32, 4);
+                    bind_u32(enc, n_heads as u32, 5);
+                    bind_u32(enc, n_kv_heads as u32, 6);
+                    bind_u32(enc, head_dim as u32, 7);
+                    bind_u32(enc, kv_dim, 8);
                 },
             );
             let kv_len = start_pos + 1;
@@ -941,23 +921,23 @@ impl Backend for MetalBackend {
         } else {
             // Prefill: causal attention over `seq_len` query columns.
             let n_tg = n_heads * seq_len;
-            self.encode_groups(
+            self.dispatch(
                 "causal_attention",
-                sz(n_tg, 1, 1),
+                Dispatch::Groups(sz(n_tg, 1, 1)),
                 sz(head_dim, 1, 1),
                 shared_mem,
                 |enc| unsafe {
-                    set_buf(enc, q, 0);
-                    set_buf(enc, k_cache, 1);
-                    set_buf(enc, v_cache, 2);
-                    set_buf(enc, out, 3);
-                    set_u32(enc, start_pos as u32, 4);
-                    set_u32(enc, seq_len as u32, 5);
-                    set_u32(enc, n_heads as u32, 6);
-                    set_u32(enc, n_kv_heads as u32, 7);
-                    set_u32(enc, head_dim as u32, 8);
-                    set_u32(enc, kv_dim, 9);
-                    set_u32(enc, n_heads as u32, 10);
+                    bind_buffer(enc, q, 0);
+                    bind_buffer(enc, k_cache, 1);
+                    bind_buffer(enc, v_cache, 2);
+                    bind_buffer(enc, out, 3);
+                    bind_u32(enc, start_pos as u32, 4);
+                    bind_u32(enc, seq_len as u32, 5);
+                    bind_u32(enc, n_heads as u32, 6);
+                    bind_u32(enc, n_kv_heads as u32, 7);
+                    bind_u32(enc, head_dim as u32, 8);
+                    bind_u32(enc, kv_dim, 9);
+                    bind_u32(enc, n_heads as u32, 10);
                 },
             );
             let kv_len = start_pos + seq_len;
@@ -971,16 +951,16 @@ impl Backend for MetalBackend {
     fn copy_into(&self, dst: &mut MetalBuffer, src: &MetalBuffer, dst_offset_elements: usize) {
         let count = src.n_elements() as u32;
         let offset = dst_offset_elements as u32;
-        self.encode(
+        self.dispatch(
             "copy_offset",
-            sz(count as usize, 1, 1),
+            Dispatch::Threads(sz(count as usize, 1, 1)),
             sz(256, 1, 1),
             0,
             |enc| unsafe {
-                set_buf(enc, src, 0);
-                set_buf(enc, dst, 1);
-                set_u32(enc, offset, 2);
-                set_u32(enc, count, 3);
+                bind_buffer(enc, src, 0);
+                bind_buffer(enc, dst, 1);
+                bind_u32(enc, offset, 2);
+                bind_u32(enc, count, 3);
             },
         );
 
@@ -988,13 +968,7 @@ impl Backend for MetalBackend {
     }
 
     fn read_to_vec_f32(&self, buf: &MetalBuffer) -> Vec<f32> {
-        if self.perf {
-            // In perf mode, all kernels already flushed individually.
-            // Dump the accumulated stats.
-            self.perf_dump();
-        } else {
-            self.flush();
-        }
+        self.flush();
         let n = buf.n_elements();
         let base = unsafe { (buf.buf.contents().as_ptr() as *const u8).add(buf.offset) };
         match buf.dtype {

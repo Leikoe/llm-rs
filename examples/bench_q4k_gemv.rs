@@ -66,13 +66,15 @@ fn bench(backend: &MetalBackend, m: usize, n: usize, iters: usize) -> (f64, f64)
     let mut rng = Xor(0xA5A5A5A5 ^ ((m * n) as u64));
     let w_bytes = random_q4k(m * n, &mut rng);
     let i_bytes = random_bf16(m, &mut rng);
+    let w_shape = [m as u64, n as u64];
     let weight = backend.upload_tensor(&TensorView {
-        name: "w".into(), dtype: DType::Q4K,
-        shape: vec![m as u64, n as u64], data: &w_bytes,
+        name: "w", dtype: DType::Q4K,
+        shape: &w_shape, data: &w_bytes,
     });
+    let i_shape = [m as u64];
     let input = backend.upload_tensor(&TensorView {
-        name: "x".into(), dtype: DType::BF16,
-        shape: vec![m as u64], data: &i_bytes,
+        name: "x", dtype: DType::BF16,
+        shape: &i_shape, data: &i_bytes,
     });
     let mut output = backend.alloc(&[n as u64], DType::BF16);
 

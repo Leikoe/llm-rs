@@ -5,6 +5,15 @@ use crate::gguf::metadata::MetadataValue;
 use crate::kv_cache::KVCache;
 use crate::tensor::DType;
 
+/// RoPE pair-selection strategy.
+#[derive(Debug, Clone, Copy)]
+pub enum RopeLayout {
+    /// LLaMA: rotate `(x[2i], x[2i+1])`.
+    Interleaved,
+    /// Qwen/HF: rotate `(x[i], x[i+head_dim/2])`.
+    SplitHalf,
+}
+
 /// Model hyperparameters parsed from GGUF metadata.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -18,9 +27,7 @@ pub struct ModelConfig {
     pub hidden_dim: usize,
     pub norm_eps: f32,
     pub rope_theta: f32,
-    /// RoPE variant. LLaMA rotates interleaved pairs (x[2i], x[2i+1]);
-    /// Qwen/HF models rotate split pairs (x[i], x[i+head_dim/2]).
-    pub rope_neox: bool,
+    pub rope_layout: RopeLayout,
     pub max_seq_len: usize,
 }
 
@@ -58,16 +65,22 @@ impl ModelConfig {
             .unwrap_or(1e-5);
         let rope_theta = get_f32(metadata, &format!("{arch}.rope.freq_base"))
             .unwrap_or(10000.0);
-        // LLaMA uses interleaved-pair RoPE; Qwen/HF models use split-half (NeoX).
-        let rope_neox = matches!(arch.as_str(), "qwen3" | "qwen2");
+        let rope_layout = if matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen2") {
+            RopeLayout::SplitHalf
+        } else {
+            RopeLayout::Interleaved
+        };
         // Cap context to avoid huge KV cache during development.
-        let max_seq_len = (get_u32(metadata, &format!("{arch}.context_length"))
-            .unwrap_or(4096) as usize)
-            .min(4096);
+        let model_ctx = get_u32(metadata, &format!("{arch}.context_length"))
+            .unwrap_or(4096) as usize;
+        let max_seq_len = model_ctx.min(4096);
+        if model_ctx > max_seq_len {
+            eprintln!("Note: model context length {model_ctx} capped to {max_seq_len}");
+        }
 
         ModelConfig {
             architecture, vocab_size, dim, n_layers, n_heads, n_kv_heads,
-            head_dim, hidden_dim, norm_eps, rope_theta, rope_neox, max_seq_len,
+            head_dim, hidden_dim, norm_eps, rope_theta, rope_layout, max_seq_len,
         }
     }
 }
@@ -90,37 +103,19 @@ fn get_f32(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<f32> 
     })
 }
 
-/// Token-mixing block. One variant per attention/SSM family. Each layer
-/// picks a variant; `forward` matches per-layer so heterogeneous stacks
-/// (e.g. Jamba: SSM + attention interleaved) drop in as new variants.
-pub enum Mixer<B: Backend> {
-    /// Grouped-query attention with RoPE. `q_norm`/`k_norm` are Qwen3's
-    /// per-head RMSNorm on Q and K applied before RoPE — `None` for LLaMA.
-    Gqa {
-        wq: B::Buffer,
-        wk: B::Buffer,
-        wv: B::Buffer,
-        wo: B::Buffer,
-        q_norm: Option<B::Buffer>,
-        k_norm: Option<B::Buffer>,
-    },
-}
-
-/// Channel-mixing block (the "FFN").
-pub enum Ffn<B: Backend> {
-    /// SwiGLU: `w2 @ (silu(w1 @ x) * (w3 @ x))`.
-    SwiGlu {
-        w1: B::Buffer,
-        w2: B::Buffer,
-        w3: B::Buffer,
-    },
-}
-
 pub struct Layer<B: Backend> {
     pub attn_norm: B::Buffer,
-    pub mixer: Mixer<B>,
+    pub wq: B::Buffer,
+    pub wk: B::Buffer,
+    pub wv: B::Buffer,
+    pub wo: B::Buffer,
+    /// Qwen3's per-head RMSNorm on Q/K applied before RoPE. `None` for LLaMA.
+    pub q_norm: Option<B::Buffer>,
+    pub k_norm: Option<B::Buffer>,
     pub ffn_norm: B::Buffer,
-    pub ffn: Ffn<B>,
+    pub w1: B::Buffer,
+    pub w2: B::Buffer,
+    pub w3: B::Buffer,
 }
 
 /// Immutable model: weights + config. Shareable across sessions.
@@ -219,40 +214,32 @@ impl<B: Backend> Transformer<B> {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             backend.rms_norm(&mut s.x_norm, &s.x, &layer.attn_norm, cfg.norm_eps);
 
-            match &layer.mixer {
-                Mixer::Gqa { wq, wk, wv, wo, q_norm, k_norm } => {
-                    backend.matmul(&mut s.q, wq, &s.x_norm);
-                    backend.matmul(&mut s.k, wk, &s.x_norm);
-                    backend.matmul(&mut s.v, wv, &s.x_norm);
-                    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
-                        backend.rms_norm_heads(&mut s.q, qn, cfg.norm_eps);
-                        backend.rms_norm_heads(&mut s.k, kn, cfg.norm_eps);
-                    }
-                    backend.rope(&mut s.q, &mut s.k, start_pos, cfg.head_dim, cfg.rope_theta, cfg.rope_neox);
-
-                    backend.copy_into(&mut kv_cache.k_cache[layer_idx], &s.k, start_pos * kv_dim);
-                    backend.copy_into(&mut kv_cache.v_cache[layer_idx], &s.v, start_pos * kv_dim);
-
-                    backend.attention(
-                        &mut s.attn_out, &s.q,
-                        &kv_cache.k_cache[layer_idx], &kv_cache.v_cache[layer_idx],
-                        start_pos, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
-                    );
-                    backend.matmul(&mut s.wo_out, wo, &s.attn_out);
-                }
+            backend.matmul(&mut s.q, &layer.wq, &s.x_norm);
+            backend.matmul(&mut s.k, &layer.wk, &s.x_norm);
+            backend.matmul(&mut s.v, &layer.wv, &s.x_norm);
+            if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                backend.rms_norm_heads(&mut s.q, qn, cfg.norm_eps);
+                backend.rms_norm_heads(&mut s.k, kn, cfg.norm_eps);
             }
+            backend.rope(&mut s.q, &mut s.k, start_pos, cfg.head_dim, cfg.rope_theta, cfg.rope_layout);
+
+            backend.copy_into(&mut kv_cache.k_cache[layer_idx], &s.k, start_pos * kv_dim);
+            backend.copy_into(&mut kv_cache.v_cache[layer_idx], &s.v, start_pos * kv_dim);
+
+            backend.attention(
+                &mut s.attn_out, &s.q,
+                &kv_cache.k_cache[layer_idx], &kv_cache.v_cache[layer_idx],
+                start_pos, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+            );
+            backend.matmul(&mut s.wo_out, &layer.wo, &s.attn_out);
             backend.add(&mut s.x2, &s.x, &s.wo_out);
 
             backend.rms_norm(&mut s.x_norm, &s.x2, &layer.ffn_norm, cfg.norm_eps);
-            match &layer.ffn {
-                Ffn::SwiGlu { w1, w2, w3 } => {
-                    backend.matmul(&mut s.gate, w1, &s.x_norm);
-                    backend.matmul(&mut s.up, w3, &s.x_norm);
-                    backend.silu(&mut s.gate);
-                    backend.mul(&mut s.gate_up, &s.gate, &s.up);
-                    backend.matmul(&mut s.ffn_out, w2, &s.gate_up);
-                }
-            }
+            backend.matmul(&mut s.gate, &layer.w1, &s.x_norm);
+            backend.matmul(&mut s.up, &layer.w3, &s.x_norm);
+            backend.silu(&mut s.gate);
+            backend.mul(&mut s.gate_up, &s.gate, &s.up);
+            backend.matmul(&mut s.ffn_out, &layer.w2, &s.gate_up);
             backend.add(&mut s.x, &s.x2, &s.ffn_out);
         }
     }

@@ -131,9 +131,9 @@ impl DType {
 
 #[derive(Debug)]
 pub struct TensorView<'a> {
-    pub name: String,
+    pub name: &'a str,
     pub dtype: DType,
-    pub shape: Vec<u64>,
+    pub shape: &'a [u64],
     pub data: &'a [u8],
 }
 

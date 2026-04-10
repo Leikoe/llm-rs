@@ -2,7 +2,7 @@
 
 use crate::arch::Loader;
 use crate::backend::Backend;
-use crate::model::{Ffn, Layer, Mixer, ModelConfig, Transformer};
+use crate::model::{Layer, ModelConfig, Transformer};
 
 pub fn build<B: Backend>(l: &mut Loader<B>, config: ModelConfig) -> Transformer<B> {
     let token_embedding = l.req("token_embd.weight");
@@ -12,20 +12,16 @@ pub fn build<B: Backend>(l: &mut Loader<B>, config: ModelConfig) -> Transformer<
     let layers = (0..config.n_layers)
         .map(|i| Layer {
             attn_norm: l.req(&format!("blk.{i}.attn_norm.weight")),
-            mixer: Mixer::Gqa {
-                wq: l.req(&format!("blk.{i}.attn_q.weight")),
-                wk: l.req(&format!("blk.{i}.attn_k.weight")),
-                wv: l.req(&format!("blk.{i}.attn_v.weight")),
-                wo: l.req(&format!("blk.{i}.attn_output.weight")),
-                q_norm: None,
-                k_norm: None,
-            },
+            wq: l.req(&format!("blk.{i}.attn_q.weight")),
+            wk: l.req(&format!("blk.{i}.attn_k.weight")),
+            wv: l.req(&format!("blk.{i}.attn_v.weight")),
+            wo: l.req(&format!("blk.{i}.attn_output.weight")),
+            q_norm: None,
+            k_norm: None,
             ffn_norm: l.req(&format!("blk.{i}.ffn_norm.weight")),
-            ffn: Ffn::SwiGlu {
-                w1: l.req(&format!("blk.{i}.ffn_gate.weight")),
-                w2: l.req(&format!("blk.{i}.ffn_down.weight")),
-                w3: l.req(&format!("blk.{i}.ffn_up.weight")),
-            },
+            w1: l.req(&format!("blk.{i}.ffn_gate.weight")),
+            w2: l.req(&format!("blk.{i}.ffn_down.weight")),
+            w3: l.req(&format!("blk.{i}.ffn_up.weight")),
         })
         .collect();
 

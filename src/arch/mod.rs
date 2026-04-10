@@ -1,8 +1,5 @@
 //! Per-architecture loaders. Each module is a declarative recipe that
 //! reads tensors from a GGUF file and assembles a `Transformer<B>`.
-//!
-//! Adding a new model = one new file here + (if structurally novel)
-//! a new `Mixer`/`Ffn` variant in `model.rs`.
 
 mod llama;
 mod qwen3;
@@ -25,7 +22,7 @@ pub fn load<B: Backend>(gguf: &GgufFile, backend: &B) -> Transformer<B> {
 
     let model = match config.architecture.as_str() {
         "llama" => llama::build(&mut loader, config),
-        "qwen3" => qwen3::build(&mut loader, config),
+        "qwen3" | "qwen35" => qwen3::build(&mut loader, config),
         other => panic!("unsupported architecture: {other}"),
     };
 
