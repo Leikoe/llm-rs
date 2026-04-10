@@ -77,15 +77,19 @@ fn system_memory_bytes() -> usize {
     }
 }
 
-/// Ensure `block_table` has enough blocks for `needed_tokens` total.
+/// Try to allocate enough blocks for `needed_tokens` total. Returns true on
+/// success, false if the pool doesn't have enough free blocks (no partial
+/// allocation — all or nothing).
 pub fn ensure_blocks<B: Backend>(
     block_table: &mut Vec<u32>,
     pool: &mut PagedKVPool<B>,
     needed_tokens: usize,
-) {
+) -> bool {
     let blocks_needed = (needed_tokens + pool.block_size - 1) / pool.block_size;
-    while block_table.len() < blocks_needed {
-        let block = pool.alloc_block().expect("OOM: no free KV blocks");
-        block_table.push(block);
+    let new_blocks = blocks_needed.saturating_sub(block_table.len());
+    if new_blocks > pool.blocks_free() { return false; }
+    for _ in 0..new_blocks {
+        block_table.push(pool.alloc_block().unwrap());
     }
+    true
 }

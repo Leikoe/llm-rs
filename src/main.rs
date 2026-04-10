@@ -99,7 +99,7 @@ fn run_completion<B: Backend, M: Model<B>>(
     eprintln!("Prompt tokens: {}", tokens.len());
 
     // Prefill
-    kv_pool::ensure_blocks(&mut block_table, pool, pos + tokens.len());
+    assert!(kv_pool::ensure_blocks(&mut block_table, pool, pos + tokens.len()), "out of KV cache memory");
     let batch = Batch::single(backend, &tokens, pos, &block_table, pool.block_size);
     let start = Instant::now();
     model.forward(backend, pool, &batch);
@@ -132,7 +132,7 @@ fn run_completion<B: Backend, M: Model<B>>(
         io::stdout().flush().unwrap();
 
         generated += 1;
-        kv_pool::ensure_blocks(&mut block_table, pool, pos + 1);
+        assert!(kv_pool::ensure_blocks(&mut block_table, pool, pos + 1), "out of KV cache memory");
         let batch = Batch::single(backend, &[next_token], pos, &block_table, pool.block_size);
         model.forward(backend, pool, &batch);
         pos += 1;
@@ -168,7 +168,7 @@ fn run_chat<B: Backend, M: Model<B>>(
         let sys_text = format!("<|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>");
         warmup.extend(tokenizer.encode(&sys_text));
     }
-    kv_pool::ensure_blocks(&mut block_table, pool, pos + warmup.len());
+    assert!(kv_pool::ensure_blocks(&mut block_table, pool, pos + warmup.len()), "out of KV cache memory");
     let batch = Batch::single(backend, &warmup, pos, &block_table, pool.block_size);
     model.forward(backend, pool, &batch);
     pos += warmup.len();
@@ -192,7 +192,7 @@ fn run_chat<B: Backend, M: Model<B>>(
             "<|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         let user_tokens = tokenizer.encode(&user_text);
-        kv_pool::ensure_blocks(&mut block_table, pool, pos + user_tokens.len());
+        assert!(kv_pool::ensure_blocks(&mut block_table, pool, pos + user_tokens.len()), "out of KV cache memory");
         let batch = Batch::single(backend, &user_tokens, pos, &block_table, pool.block_size);
         model.forward(backend, pool, &batch);
         pos += user_tokens.len();
@@ -208,7 +208,7 @@ fn run_chat<B: Backend, M: Model<B>>(
             io::stdout().write_all(&piece).unwrap();
             io::stdout().flush().unwrap();
 
-            kv_pool::ensure_blocks(&mut block_table, pool, pos + 1);
+            assert!(kv_pool::ensure_blocks(&mut block_table, pool, pos + 1), "out of KV cache memory");
             let batch = Batch::single(backend, &[next_token], pos, &block_table, pool.block_size);
             model.forward(backend, pool, &batch);
             pos += 1;
