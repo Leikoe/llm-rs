@@ -13,34 +13,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "bench_throughput")]
+struct Args {
+    /// Server URL
+    #[arg(long, default_value = "http://localhost:8080")]
+    url: String,
+
+    /// Requests to run concurrently
+    #[arg(long, default_value = "8")]
+    concurrent: usize,
+
+    /// Max tokens per request
+    #[arg(long, default_value = "32")]
+    max_tokens: usize,
+
+    /// Sweep concurrency levels (1, 2, 4, ..., 128)
+    #[arg(long)]
+    sweep: bool,
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let url = arg(&args, "--url").unwrap_or("http://localhost:8080".into());
-    let max_tokens: usize = arg(&args, "--max-tokens").unwrap_or("32".into()).parse().unwrap();
-    let sweep = args.iter().any(|a| a == "--sweep");
+    let args = Args::parse();
 
-    if sweep {
+    if args.sweep {
         eprintln!("Sweeping concurrency levels...\n");
         eprintln!("{:>10} {:>10} {:>12} {:>12}", "concurrent", "tokens", "wall (s)", "agg tok/s");
         eprintln!("{}", "-".repeat(48));
         for &c in &[1, 2, 4, 8, 16, 32, 64, 128] {
-            let (total_tokens, wall) = run_bench(&url, c, max_tokens).await;
+            let (total_tokens, wall) = run_bench(&args.url, c, args.max_tokens).await;
             let tps = total_tokens as f64 / wall;
             eprintln!("{:>10} {:>10} {:>12.2} {:>12.1}", c, total_tokens, wall, tps);
         }
     } else {
-        let concurrent: usize = arg(&args, "--concurrent").unwrap_or("8".into()).parse().unwrap();
-        let (total_tokens, wall) = run_bench(&url, concurrent, max_tokens).await;
+        let (total_tokens, wall) = run_bench(&args.url, args.concurrent, args.max_tokens).await;
         let tps = total_tokens as f64 / wall;
         eprintln!(
-            "\nconcurrent={concurrent}  tokens={total_tokens}  wall={wall:.2}s  throughput={tps:.1} tok/s"
+            "\nconcurrent={}  tokens={}  wall={:.2}s  throughput={:.1} tok/s",
+            args.concurrent, total_tokens, wall, tps
         );
     }
-}
-
-fn arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
 
 async fn run_bench(url: &str, concurrent: usize, max_tokens: usize) -> (usize, f64) {
